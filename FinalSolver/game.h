@@ -27,7 +27,6 @@ struct Encoding {
 typedef uint64_t Bitboard;
 
 // gcc -o solver solver.c othello4.c file_lst.c num_lst.c game.c
-// mpiexec -o mpi_solver mpi_solver.c othello4.c file_lst.c num_lst.c game.c
 
 // Provides valid moves given an Encoding
 // Valid moves will be denoted 1 in the return value
