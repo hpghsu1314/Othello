@@ -1,6 +1,12 @@
 CC = gcc
 MPICC = mpicc
-CFLAGS = -Wextra -O3
+
+ifeq ($(DEBUG),1)
+	CFLAGS = -g -O0 -Wall -Wextra
+else
+	CFLAGS = -O3 -Wall -Wextra
+endif
+$(info [INFO] Building with CFLAGS = $(CFLAGS))
 
 PROJECT_ROOT = .
 NAIVE_DIR = FinalSolver
