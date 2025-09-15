@@ -1,12 +1,25 @@
 #pragma once
 #include <cstdint>
 #include "bitops6.hpp"
-#include "game.hpp"
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
   #include <immintrin.h>  // for _pext_u64 / _pdep_u64 (BMI2)
 #endif
+#if defined(_MSC_VER)
+  #include <intrin.h>     // __popcnt64 on MSVC
+#endif
+#if __cpp_lib_bitops >= 201907L
+  #include <bit>            // std::popcount
+#endif
 
-namespace othello6 {
+#if defined(_MSC_VER)
+  #define OTH_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+  #define OTH_FORCE_INLINE inline __attribute__((always_inline))
+#else
+  #define OTH_FORCE_INLINE inline
+#endif
+
+namespace game {
     using bitops6::Bitboard;
     using bitops6::FULL;
     using bitops6::NOT_A;
@@ -16,10 +29,20 @@ namespace othello6 {
     using bitops6::transpose6;
     using bitops6::N;
 
-    // If you need Encoding in this header:
-    using games::Encoding;
+    // Shared byte encodings
+    inline constexpr std::uint8_t WIN  = 0b1100'0000;
+    inline constexpr std::uint8_t DRAW = 0b1000'0000;
+    inline constexpr std::uint8_t LOSE = 0b0100'0000;
+    inline constexpr std::uint8_t SKIP = 0b0000'0000;
+    inline constexpr std::uint8_t FOUND = 0b1111'1111;
 
-    inline Bitboard ks_dir_l(Bitboard me, Bitboard opp, Bitboard empty, int s, Bitboard mask) {
+    // Minimal “position” for two-player, bitboard-style games.
+    struct Encoding {
+        Bitboard player;   // bits for side-to-move
+        Bitboard opponent; // bits for opponent
+    };
+
+    OTH_FORCE_INLINE Bitboard ks_dir_l(Bitboard me, Bitboard opp, Bitboard empty, int s, Bitboard mask) {
         Bitboard t = opp & mask & (me << s);
         t |= opp & mask & (t << s);
         t |= opp & mask & (t << s);
@@ -27,7 +50,7 @@ namespace othello6 {
         t |= opp & mask & (t << s);   // 5 cascades for 6x6
         return (t << s) & mask & empty;
     }
-    inline Bitboard ks_dir_r(Bitboard me, Bitboard opp, Bitboard empty, int s, Bitboard mask) {
+    OTH_FORCE_INLINE Bitboard ks_dir_r(Bitboard me, Bitboard opp, Bitboard empty, int s, Bitboard mask) {
         Bitboard t = opp & mask & (me >> s);
         t |= opp & mask & (t >> s);
         t |= opp & mask & (t >> s);
@@ -36,7 +59,7 @@ namespace othello6 {
         return (t >> s) & mask & empty;
     }
 
-    inline Bitboard legal_moves(const Encoding& pos) {
+    OTH_FORCE_INLINE Bitboard legal_moves(const Encoding& pos) {
         const Bitboard me = pos.player & FULL;
         const Bitboard opp = pos.opponent & FULL;
         const Bitboard empty = FULL & ~(me | opp);
@@ -54,7 +77,7 @@ namespace othello6 {
     }
 
     // Collect flips in the "left-shift" directions (E, N, NE, NW)
-    inline Bitboard sweep_l(Bitboard mv, Bitboard me, Bitboard opp, int s, Bitboard mask) {
+    OTH_FORCE_INLINE Bitboard sweep_l(Bitboard mv, Bitboard me, Bitboard opp, int s, Bitboard mask) {
         Bitboard flips = 0;
         Bitboard cur   = (mv << s) & mask;
         // Walk through opponent stones
@@ -67,7 +90,7 @@ namespace othello6 {
     }
 
     // Collect flips in the "right-shift" directions (W, S, SW, SE)
-    inline Bitboard sweep_r(Bitboard mv, Bitboard me, Bitboard opp, int s, Bitboard mask) {
+    OTH_FORCE_INLINE Bitboard sweep_r(Bitboard mv, Bitboard me, Bitboard opp, int s, Bitboard mask) {
         Bitboard flips = 0;
         Bitboard cur   = (mv >> s) & mask;
         while (cur && (cur & opp)) {
@@ -78,13 +101,9 @@ namespace othello6 {
     }
 
     // Apply a single-bit move 'mv' for side-to-move in 'pos'
-    inline games::Encoding do_move(const games::Encoding& pos, Bitboard mv) {
+    inline Encoding do_move(const Encoding& pos, Bitboard mv) {
         Bitboard me  = pos.player & FULL;
         Bitboard opp = pos.opponent & FULL;
-
-        // (Optional) you can assert mv is a single bit and legal if you want:
-        // assert(mv && !(mv & (mv-1)));
-        // assert(mv & legal_moves(pos));
 
         const Bitboard flips =
             sweep_l(mv, me, opp, 1, NOT_A) |  // East
@@ -98,16 +117,16 @@ namespace othello6 {
 
         me  ^= flips;
         opp ^= flips;
-        me  |= mv;          // place the new stone
+        me  |= mv;
 
         return { me & FULL, opp & FULL };
     }
 
-    inline games::Encoding flip(const Encoding& pos) {
+    OTH_FORCE_INLINE Encoding flip(const Encoding& pos) {
         return { pos.opponent, pos.player };
     }
 
-    inline games::Encoding canonical(const Encoding& pos) noexcept {
+    inline Encoding canonical(const Encoding& pos) noexcept {
         const Bitboard me  = pos.player   & FULL;
         const Bitboard opp = pos.opponent & FULL;
         const Bitboard occ = me | opp;
@@ -125,9 +144,11 @@ namespace othello6 {
         // Find minimal occupancy; track ties in a bitmask
         Bitboard best_occ = occ0;
         unsigned tie = 1u << 0;
-        auto upd = [&](Bitboard x, unsigned b) {
-            if (x < best_occ) { best_occ = x; tie = b; }
-            else if (x == best_occ) tie |= b;
+        auto upd = [&](Bitboard x, unsigned b){
+            const bool lt = x < best_occ;
+            const bool eq = x == best_occ;
+            best_occ = lt ? x : best_occ;
+            tie = lt ? b : (eq ? (tie | b) : tie);
         };
         upd(occ1,1u<<1); upd(occ2,1u<<2); upd(occ3,1u<<3);
         upd(occ4,1u<<4); upd(occ5,1u<<5); upd(occ6,1u<<6); upd(occ7,1u<<7);
@@ -165,7 +186,7 @@ namespace othello6 {
         if (tie & (1u<<4)) {
             if (!have_t) { me_t = transpose6(me); have_t = true; }
             const Bitboard m5tmp = vertical6(me_t);      // R90
-            const Bitboard m4    = horizontal6(m5tmp);   // ADIAG
+            const Bitboard m4 = horizontal6(m5tmp);   // ADIAG
             if (m4 < best_me) best_me = m4;
         }
 
@@ -193,17 +214,16 @@ namespace othello6 {
         return { best_me, best_occ ^ best_me };
     }
 
-    // 1) Occupancy "shape" (your shard key)
-    inline Bitboard shape(const games::Encoding& s) noexcept {
+    // 1) Occupancy "shape"
+    OTH_FORCE_INLINE Bitboard shape(const Encoding& s) noexcept {
         return (s.player | s.opponent) & FULL;
     }
 
     // 2) Pack player's bits over the shape into a compact hash (low bits)
     //    BMI2 _pext_u64 path (fast), with a portable fallback.
-    inline std::uint64_t hash(const games::Encoding& s) noexcept {
+    inline std::uint64_t hash(const Encoding& s) noexcept {
         const Bitboard sh = shape(s);
-    #if defined(__BMI2__) || (defined(_MSC_VER) && defined(__AVX2__)) // MSVC sets BMI2 differently
-        // _pext_u64 extracts bits of s.player selected by sh and packs them densely.
+    #if defined(__BMI2__)
         return _pext_u64(s.player, sh);
     #else
         // Portable fallback: iterate set bits of sh (in index order) and pack.
@@ -211,11 +231,10 @@ namespace othello6 {
         std::uint64_t pos = 0;
         Bitboard m = sh;
         while (m) {
-            const int i = __builtin_ctzll(m);        // next set bit in shape
-            const std::uint64_t bit = (s.player >> i) & 1ULL;
-            h |= (bit << pos);
+            Bitboard b = m & -m;
+            if (s.player & b) h |= (1ULL << pos);
             ++pos;
-            m &= (m - 1);                            // clear that bit
+            m ^= b;                             // clear the bit
         }
         return h;
     #endif
@@ -223,26 +242,93 @@ namespace othello6 {
 
     // 3) Unpack compact hash back into full bitboards (player/opponent) given a shape.
     //    BMI2 _pdep_u64 path (fast), with a portable fallback.
-    inline games::Encoding unhash(Bitboard sh, std::uint64_t h) noexcept {
-    #if defined(__BMI2__) || (defined(_MSC_VER) && defined(__AVX2__))
-        // _pdep_u64 deposits low bits of h into the bit positions given by sh.
-        const Bitboard me  = _pdep_u64(h, sh);
+    inline Encoding unhash(Bitboard sh, std::uint64_t h) noexcept {
+    #if defined(__BMI2__)
+        const Bitboard me = _pdep_u64(h, sh);
         const Bitboard occ = sh;
-        const Bitboard opp = occ ^ me;
-        return { me & FULL, opp & FULL };
+        return { me & FULL, (occ ^ me) & FULL };
     #else
-        Bitboard me  = 0;
-        Bitboard opp = 0;
-        Bitboard m   = sh;
-        std::uint64_t pos = 0;
+        Bitboard me = 0;
+        std::uint64_t m = sh, src = h;
         while (m) {
-            const int i = __builtin_ctzll(m);
-            if ((h >> pos) & 1ULL) me  |= (1ULL << i);
-            else                   opp |= (1ULL << i);
-            ++pos;
-            m &= (m - 1);
+            std::uint64_t b = m & -m;
+            if (src & 1ull) me |= b;
+            src >>= 1;
+            m ^= b;
         }
-        return { me & FULL, opp & FULL };
+        const Bitboard occ = sh;
+        return { me & FULL, (occ ^ me) & FULL };
     #endif
     }
+
+    inline std::uint8_t primitive(const Encoding& pos) noexcept {
+        const Bitboard me = pos.player;
+        const Bitboard opp = pos.opponent;
+
+        if ((legal_moves(pos) | legal_moves(flip(pos))) != 0) return 0;
+
+        int my_count, opp_count;
+    #if defined(__GNUC__) || defined(__clang__)
+        my_count = __builtin_popcountll(me);
+        opp_count = __builtin_popcountll(opp);
+    #elif defined(_MSC_VER)
+        my_count = static_cast<int>(__popcnt64(me));
+        opp_count = static_cast<int>(__popcnt64(opp));
+    #else
+        // Portable & fast enough
+        auto pc = [](Bitboard x){ int c=0; while (x){ x&=x-1; ++c; } return c; };
+        my_count = pc(me);
+        opp_count = pc(opp);
+    #endif
+
+        if (my_count > opp_count) return WIN;
+        if (my_count < opp_count) return LOSE;
+        return DRAW;
+    }
+
+    OTH_FORCE_INLINE std::uint8_t tier_of(Bitboard shapeMask) noexcept {
+    #if __cpp_lib_bitops >= 201907L
+        return static_cast<std::uint8_t>(std::popcount(shapeMask));
+    #elif defined(_MSC_VER)
+        return static_cast<std::uint8_t>(__popcnt64(shapeMask));
+    #elif defined(__GNUC__) || defined(__clang__)
+        return static_cast<std::uint8_t>(__builtin_popcountll(shapeMask));
+    #else
+        std::uint64_t x = shapeMask; int c = 0; while (x) { x &= (x - 1); ++c; }
+        return static_cast<std::uint8_t>(c);
+    #endif
+    }
+
+    struct Game {
+        using Encoding = game::Encoding;
+
+        std::uint64_t legal_moves(const Encoding& s) const noexcept {
+            return game::legal_moves(s);
+        }
+        Encoding do_move(const Encoding& s, std::uint64_t mv) const noexcept {
+            return game::do_move(s, mv);
+        }
+        Encoding flip(const Encoding& s) const noexcept {
+            return game::flip(s);
+        }
+        Encoding canonical(const Encoding& s) const noexcept {
+            return game::canonical(s);
+        }
+        std::uint64_t shape(const Encoding& s) const noexcept {
+            return game::shape(s);
+        }
+        std::uint64_t hash(const Encoding& s) const noexcept {
+            return game::hash(s);
+        }
+        Encoding unhash(std::uint64_t sh, std::uint64_t h) const noexcept {
+            return game::unhash(sh, h);
+        }
+        std::uint8_t primitive(const Encoding& s) const noexcept {
+            return game::primitive(s);
+        }
+        uint8_t tier_of(Bitboard shapemask) const noexcept {
+            return game::tier_of(shapemask);
+        }
+    };
 }
+#undef OTH_FORCE_INLINE
