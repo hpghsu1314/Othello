@@ -296,6 +296,10 @@ namespace game {
     #endif
     }
 
+    OTH_FORCE_INLINE std::uint64_t starting_position() {
+        return game::Encoding{ 0b0000010000100000, 0b0000001001000000 };
+    }
+
     struct Game {
         using Encoding = game::Encoding;
 
@@ -323,8 +327,11 @@ namespace game {
         std::uint8_t primitive(const Encoding& s) const noexcept {
             return game::primitive(s);
         }
-        uint8_t tier_of(Bitboard shapemask) const noexcept {
+        std::uint8_t tier_of(Bitboard shapemask) const noexcept {
             return game::tier_of(shapemask);
+        }
+        std::uint64_t starting_position() const noexcept {
+            return game::starting_position();
         }
     };
 }
