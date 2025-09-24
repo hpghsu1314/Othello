@@ -35,6 +35,8 @@ namespace game {
     inline constexpr std::uint8_t LOSE = 0b0100'0000;
     inline constexpr std::uint8_t SKIP = 0b0000'0000;
     inline constexpr std::uint8_t FOUND = 0b1111'1111;
+    inline constexpr std::uint8_t MAX_TIER = 16;
+
 
     // Minimal “position” for two-player, bitboard-style games.
     struct Encoding {
@@ -296,7 +298,7 @@ namespace game {
     #endif
     }
 
-    OTH_FORCE_INLINE std::uint64_t starting_position() {
+    Encoding starting_position() {
         return game::Encoding{ 0b0000010000100000, 0b0000001001000000 };
     }
 
@@ -330,7 +332,7 @@ namespace game {
         std::uint8_t tier_of(Bitboard shapemask) const noexcept {
             return game::tier_of(shapemask);
         }
-        std::uint64_t starting_position() const noexcept {
+        Encoding starting_position() const noexcept {
             return game::starting_position();
         }
     };

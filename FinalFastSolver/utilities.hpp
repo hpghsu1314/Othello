@@ -1,4 +1,5 @@
 #pragma once
+
 #include <cstdint>
 
 static inline std::uint64_t splitmix64(std::uint64_t x) {

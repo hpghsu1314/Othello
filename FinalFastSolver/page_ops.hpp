@@ -15,9 +15,9 @@ namespace pageops {
 
 namespace fs = std::filesystem;
 
-static constexpr std::size_t PAGE_BITS      = 12;                           // 2^16 bits/page
-static constexpr std::size_t PAGE_BYTES     = (1u << (PAGE_BITS - 3));      // 8 KiB
-static constexpr std::size_t PAGE_QWORDS    = PAGE_BYTES / sizeof(std::uint64_t);
+static constexpr std::size_t PAGE_BITS = 12;
+static constexpr std::size_t PAGE_BYTES = (1u << (PAGE_BITS - 3));
+static constexpr std::size_t PAGE_QWORDS = PAGE_BYTES / sizeof(std::uint64_t);
 
 struct Key {
     std::uint64_t shape;
@@ -66,7 +66,7 @@ struct Context {
     CacheMap cache;             // (shape,page) -> page buffer (in-place, no moves/copies)
 
     // Cache size knob (pages)
-    std::size_t cache_cap_pages = 64*1024;
+    std::size_t cache_cap_pages = 4096;
 
     // OpenMP locks
     omp_lock_t meta_lock;
@@ -237,18 +237,13 @@ inline PageBuf* find_cached(Context& ctx, std::uint64_t shape, std::uint32_t pag
 inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
     const Key k{shape, page_id};
 
-    // Fast probe
     if (PageBuf* p = find_cached(ctx, shape, page_id)) return *p;
-
-    // Ensure exists on disk and get its offset (unique, published)
     const std::uint64_t off = ensure_page_exists_fast(ctx, shape, page_id);
 
-    // Insert (or find existing) in cache
     omp_set_lock(&ctx.cache_lock);
-    auto [it, inserted] = ctx.cache.try_emplace(k);   // default-constructs PageBuf if missing
+    auto [it, inserted] = ctx.cache.try_emplace(k);
     PageBuf* ref = &it->second;
     if (inserted) {
-        // Pin page so concurrent set_bit will wait until load is done
         while (ref->lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
     }
     omp_unset_lock(&ctx.cache_lock);
@@ -273,7 +268,6 @@ inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t p
         std::size_t evicted = 0;
         std::size_t target  = 0;
 
-        // First pass: clean victims
         omp_set_lock(&ctx.cache_lock);
         if (ctx.cache.size() > ctx.cache_cap_pages) {
             target = ctx.cache.size() / 4;
@@ -286,7 +280,6 @@ inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t p
         omp_unset_lock(&ctx.cache_lock);
 
         if (evicted < target) {
-            // Second pass: choose dirty victims, flush, then evict
             const std::size_t need = target - evicted;
             std::vector<Key> victims; victims.reserve(need);
 
@@ -311,16 +304,12 @@ inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t p
         }
     }
 
-    // Return current entry (re-find under lock to avoid stale iterators)
     omp_set_lock(&ctx.cache_lock);
     PageBuf& out = ctx.cache.find(k)->second;
     omp_unset_lock(&ctx.cache_lock);
     return out;
+
 }
-
-
-
-// ---------- bit set (thread-safe per page). Returns true if 0->1 ----------
 
 inline bool set_bit(Context& ctx,
                     std::uint64_t shape,
