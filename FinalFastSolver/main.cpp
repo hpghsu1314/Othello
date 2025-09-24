@@ -208,10 +208,12 @@ int main(int argc, char** argv) {
 
     // Forward declare batch handler; self-processing is iterative (no recursion)
     std::function<void(const HitMsg*, int)> handle_batch;
-    int how_many_pos = 0;
+    unsigned long long how_many_pos = 0;
+
     // Process a single self-dest hit and expand iteratively (DFS-like).
+    // IMPORTANT CHANGE: we NEVER call MPI here anymore. We only push remote
+    // children into per-destination staging; the main loop ships them.
     auto process_self_iter = [&](const HitMsg& seed) {
-        // Local LIFO stack that lives only for this call (no long-lived queue).
         std::vector<HitMsg> stack;
         stack.reserve(1024);
         stack.push_back(seed);
@@ -225,8 +227,9 @@ int main(int argc, char** argv) {
 
             if (!pageops::set_bit(ctx, msg.shape, msg.page, msg.bit))
                 continue; // already seen
-            how_many_pos++;
-            fflush(stdout);
+
+            ++how_many_pos;
+
             const std::uint64_t h =
                 ((std::uint64_t)msg.page << pageops::PAGE_BITS) |
                  (std::uint64_t)msg.bit;
@@ -243,10 +246,7 @@ int main(int argc, char** argv) {
                     if (dest == R) {
                         stack.emplace_back(m2); // keep processing locally
                     } else {
-                        auto& o = out[dest];
-                        o.staging.emplace_back(m2);
-                        // Eager, non-blocking attempt to ship
-                        try_send_dest_nb(o, dest, HIT_T, TAG_HITS, sent_hits);
+                        out[dest].staging.emplace_back(m2); // NO MPI here
                     }
                 }
             } else {
@@ -256,14 +256,12 @@ int main(int argc, char** argv) {
                 if (dest == R) {
                     stack.emplace_back(m2);
                 } else {
-                    auto& o = out[dest];
-                    o.staging.emplace_back(m2);
-                    try_send_dest_nb(o, dest, HIT_T, TAG_HITS, sent_hits);
+                    out[dest].staging.emplace_back(m2); // NO MPI here
                 }
             }
         }
     };
-    
+
     // Batch handler: route each message (self -> process now; remote children are staged)
     handle_batch = [&](const HitMsg* msgs, int n) {
         for (int i = 0; i < n; ++i) {
@@ -272,10 +270,7 @@ int main(int argc, char** argv) {
             if (dest == R) {
                 process_self_iter(m);
             } else {
-                // Very rare (since we're receiving), but handle defensively
-                auto& o = out[dest];
-                o.staging.emplace_back(m);
-                try_send_dest_nb(o, dest, HIT_T, TAG_HITS, sent_hits);
+                out[dest].staging.emplace_back(m); // NO MPI here
             }
         }
     };
@@ -287,15 +282,14 @@ int main(int argc, char** argv) {
         if (dest0 == R) {
             process_self_iter(m0);
         } else {
-            out[dest0].staging.emplace_back(m0);
-            try_send_dest_nb(out[dest0], dest0, HIT_T, TAG_HITS, sent_hits);
+            out[dest0].staging.emplace_back(m0); // NO MPI here
         }
     }
 
     // Main progress loop
     int global_continue = 1;
     do {
-        // Drain MPI receives
+        // Drain MPI receives (expands self work immediately, stages remote work)
         int rx_progress = progress_receives(rxbuf, rxreq, HIT_T, TAG_HITS, handle_batch, recv_hits);
 
         // Eagerly try to ship any staged remote work (non-blocking)
@@ -341,7 +335,9 @@ int main(int argc, char** argv) {
             pageops::pages_close(ctx_by_tier[t]);
         }
     }
-    printf("%d\n", how_many_pos);
+
+    std::printf("%llu\n", (unsigned long long)how_many_pos);
+
     // Tear down receive
     MPI_Cancel(&rxreq);
     MPI_Request_free(&rxreq);
