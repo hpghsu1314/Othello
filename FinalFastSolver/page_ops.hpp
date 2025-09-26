@@ -8,15 +8,13 @@
 #include <array>
 #include <vector>
 #include <filesystem>
-#include <atomic>
-#include <omp.h>
 
 namespace pageops {
 
 namespace fs = std::filesystem;
 
-static constexpr std::size_t PAGE_BITS = 12;
-static constexpr std::size_t PAGE_BYTES = (1u << (PAGE_BITS - 3));
+static constexpr std::size_t PAGE_BITS   = 12;
+static constexpr std::size_t PAGE_BYTES  = (1u << (PAGE_BITS - 3));              // 2^(PAGE_BITS)/8
 static constexpr std::size_t PAGE_QWORDS = PAGE_BYTES / sizeof(std::uint64_t);
 
 struct Key {
@@ -40,16 +38,15 @@ struct PageIdxRec { std::uint64_t shape; std::uint32_t page; std::uint64_t off; 
 static_assert(sizeof(PageIdxRec)==20, "PageIdxRec must be 20 bytes");
 
 struct PageBuf {
-    alignas(64) std::array<std::uint64_t, PAGE_QWORDS> w;
-    std::atomic_flag lock;
-    bool dirty;
-    PageBuf() : w{}, lock(ATOMIC_FLAG_INIT), dirty(false) {}    // default-constructible; no copy/move
+    alignas(64) std::array<std::uint64_t, PAGE_QWORDS> w{};
+    bool dirty{false};
+    PageBuf() = default;
     PageBuf(const PageBuf&)            = delete;
     PageBuf& operator=(const PageBuf&) = delete;
 };
 
 using MetaMap  = std::unordered_map<Key, std::uint64_t, KeyHash>;
-using CacheMap = std::unordered_map<Key, PageBuf, KeyHash>;
+using CacheMap = std::unordered_map<Key, PageBuf,   KeyHash>;
 
 struct Context {
     // Hot file handles (kept open)
@@ -66,13 +63,7 @@ struct Context {
     CacheMap cache;             // (shape,page) -> page buffer (in-place, no moves/copies)
 
     // Cache size knob (pages)
-    std::size_t cache_cap_pages = 4096;
-
-    // OpenMP locks
-    omp_lock_t meta_lock;
-    omp_lock_t cache_lock;
-    omp_lock_t data_lock;
-    omp_lock_t idx_lock;
+    std::size_t cache_cap_pages = 4096u * 16u;
 
     bool inited{false};
 };
@@ -106,11 +97,6 @@ inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::st
     std::fseek(ctx.data, 0, SEEK_END);
     ctx.file_size = (std::size_t)std::ftell(ctx.data);
 
-    omp_init_lock(&ctx.meta_lock);
-    omp_init_lock(&ctx.cache_lock);
-    omp_init_lock(&ctx.data_lock);
-    omp_init_lock(&ctx.idx_lock);
-
     ctx.inited = true;
 }
 
@@ -123,66 +109,45 @@ inline void pages_close(Context& ctx) {
     pages_flush(ctx);
     if (ctx.data) { std::fclose(ctx.data); ctx.data=nullptr; }
     if (ctx.idx)  { std::fclose(ctx.idx);  ctx.idx=nullptr;  }
-    if (ctx.inited) {
-        omp_destroy_lock(&ctx.meta_lock);
-        omp_destroy_lock(&ctx.cache_lock);
-        omp_destroy_lock(&ctx.data_lock);
-        omp_destroy_lock(&ctx.idx_lock);
-        ctx.inited = false;
-    }
+    ctx.inited = false;
 }
 
-// ---------- flush (call outside parallel regions) ----------
+// ---------- flush (no threading) ----------
 
 inline void flush_page(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
-    // Snapshot pointer
-    omp_set_lock(&ctx.cache_lock);
-    auto it = ctx.cache.find(Key{shape,page_id});
-    PageBuf* p = (it==ctx.cache.end()) ? nullptr : &it->second;
-    omp_unset_lock(&ctx.cache_lock);
-    if (!p) return;
+    const Key k{shape,page_id};
+    auto it = ctx.cache.find(k);
+    if (it == ctx.cache.end()) return;
+    PageBuf& p = it->second;
 
-    // Serialize with writers
-    while (p->lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
-    if (p->dirty) {
-        std::uint64_t off;
-        omp_set_lock(&ctx.meta_lock);
-        off = ctx.meta_map[Key{shape,page_id}];
-        omp_unset_lock(&ctx.meta_lock);
+    if (p.dirty) {
+        const auto mit = ctx.meta_map.find(k);
+        if (mit == ctx.meta_map.end()) { std::fprintf(stderr, "flush_page: missing meta\n"); std::exit(1); }
+        const std::uint64_t off = mit->second;
 
-        omp_set_lock(&ctx.data_lock);
         std::fseek(ctx.data, (long)off, SEEK_SET);
-        if (std::fwrite(p->w.data(), 1, PAGE_BYTES, ctx.data) != PAGE_BYTES) {
+        if (std::fwrite(p.w.data(), 1, PAGE_BYTES, ctx.data) != PAGE_BYTES) {
             std::perror("fwrite pages.dat"); std::exit(1);
         }
-        omp_unset_lock(&ctx.data_lock);
-        p->dirty = false;
+        p.dirty = false;
     }
-    p->lock.clear(std::memory_order_release);
 }
 
 inline void flush_all(Context& ctx) {
-    // snapshot keys
-    std::vector<Key> keys;
-    omp_set_lock(&ctx.cache_lock);
-    keys.reserve(ctx.cache.size());
-    for (auto &kv : ctx.cache) keys.push_back(kv.first);
-    omp_unset_lock(&ctx.cache_lock);
-
-    for (const Key& k : keys) flush_page(ctx, k.shape, k.page);
+    for (auto &kv : ctx.cache) {
+        const Key& k = kv.first;
+        flush_page(ctx, k.shape, k.page);
+    }
     if (ctx.data) std::fflush(ctx.data);
     if (ctx.idx)  std::fflush(ctx.idx);
 }
 
 inline std::uint64_t offset_of(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
-    omp_set_lock(&ctx.meta_lock);
     auto it = ctx.meta_map.find(Key{shape,page_id});
-    const std::uint64_t off = (it==ctx.meta_map.end()) ? ~0ULL : it->second;
-    omp_unset_lock(&ctx.meta_lock);
-    return off;
+    return (it==ctx.meta_map.end()) ? ~0ULL : it->second;
 }
 
-// ---------- ensure page exists (thread-safe), return offset ----------
+// ---------- ensure page exists (single-threaded), return offset ----------
 
 inline std::uint64_t ensure_page_exists_fast(Context& ctx,
                                              std::uint64_t shape,
@@ -190,48 +155,34 @@ inline std::uint64_t ensure_page_exists_fast(Context& ctx,
 {
     const Key k{shape,page_id};
 
-    // Fast path under meta lock
-    omp_set_lock(&ctx.meta_lock);
-    if (auto it = ctx.meta_map.find(k); it != ctx.meta_map.end()) {
-        const std::uint64_t off = it->second;
-        omp_unset_lock(&ctx.meta_lock);
-        return off;
-    }
+    if (auto it = ctx.meta_map.find(k); it != ctx.meta_map.end())
+        return it->second;
 
-    // Reserve a unique offset and PUBLISH the mapping immediately,
-    // so other threads see it and don't try to create again.
+    // Reserve unique offset and publish mapping
     const std::uint64_t off = ctx.file_size;
     ctx.file_size += PAGE_BYTES;
     ctx.meta_map.try_emplace(k, off);
-    omp_unset_lock(&ctx.meta_lock);
 
-    // Write the page at the RESERVED offset (not append), so offset is stable.
-    omp_set_lock(&ctx.data_lock);
+    // Write zero page at the reserved offset
     std::fseek(ctx.data, (long)off, SEEK_SET);
     if (std::fwrite(ZERO_PAGE, 1, PAGE_BYTES, ctx.data) != PAGE_BYTES) {
         std::perror("fwrite pages.dat"); std::exit(1);
     }
-    omp_unset_lock(&ctx.data_lock);
 
-    // Append one index record
-    omp_set_lock(&ctx.idx_lock);
+    // Append index record
     const PageIdxRec rec{shape, page_id, off};
     if (std::fwrite(&rec, 1, sizeof(rec), ctx.idx) != sizeof(rec)) {
         std::perror("fwrite pages.idx"); std::exit(1);
     }
-    omp_unset_lock(&ctx.idx_lock);
 
     return off;
 }
 
-// ---------- cache management (thread-safe) ----------
+// ---------- cache management (single-threaded) ----------
 
 inline PageBuf* find_cached(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
-    omp_set_lock(&ctx.cache_lock);
     auto it = ctx.cache.find(Key{shape,page_id});
-    PageBuf* ptr = (it==ctx.cache.end()) ? nullptr : &it->second;
-    omp_unset_lock(&ctx.cache_lock);
-    return ptr;
+    return (it==ctx.cache.end()) ? nullptr : &it->second;
 }
 
 inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
@@ -240,75 +191,42 @@ inline PageBuf& ensure_cached(Context& ctx, std::uint64_t shape, std::uint32_t p
     if (PageBuf* p = find_cached(ctx, shape, page_id)) return *p;
     const std::uint64_t off = ensure_page_exists_fast(ctx, shape, page_id);
 
-    omp_set_lock(&ctx.cache_lock);
+    // Insert and initialize from disk
     auto [it, inserted] = ctx.cache.try_emplace(k);
     PageBuf* ref = &it->second;
     if (inserted) {
-        while (ref->lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
-    }
-    omp_unset_lock(&ctx.cache_lock);
-
-    if (inserted) {
-        // Load from disk without holding cache_lock
         std::array<std::uint64_t, PAGE_QWORDS> tmp;
-        omp_set_lock(&ctx.data_lock);
         std::fseek(ctx.data, (long)off, SEEK_SET);
         if (std::fread(tmp.data(), 1, PAGE_BYTES, ctx.data) != PAGE_BYTES) {
             std::perror("fread pages.dat"); std::exit(1);
         }
-        omp_unset_lock(&ctx.data_lock);
-
-        // Copy into the pinned page; use sizeof(ref->w) to keep analyzer happy
         std::memcpy(ref->w.data(), tmp.data(), sizeof(ref->w));
         ref->dirty = false;
-        ref->lock.clear(std::memory_order_release);
 
-        // Evict (possibly) after the page is fully initialized
-        // Evict ~25% but never the page we just loaded
-        std::size_t evicted = 0;
-        std::size_t target  = 0;
-
-        omp_set_lock(&ctx.cache_lock);
+        // Evict if over capacity (~25% of cache), prefer clean pages first
         if (ctx.cache.size() > ctx.cache_cap_pages) {
-            target = ctx.cache.size() / 4;
+            const std::size_t target = ctx.cache.size() / 4;
+            std::size_t evicted = 0;
+
+            // First pass: erase clean pages
             for (auto e = ctx.cache.begin(); e != ctx.cache.end() && evicted < target; ) {
                 if (e->first.shape == k.shape && e->first.page == k.page) { ++e; continue; }
                 if (!e->second.dirty) { e = ctx.cache.erase(e); ++evicted; }
                 else ++e;
             }
-        }
-        omp_unset_lock(&ctx.cache_lock);
 
-        if (evicted < target) {
-            const std::size_t need = target - evicted;
-            std::vector<Key> victims; victims.reserve(need);
-
-            omp_set_lock(&ctx.cache_lock);
-            for (auto &kv : ctx.cache) {
-                if (kv.first.shape == k.shape && kv.first.page == k.page) continue;
-                if (kv.second.dirty) {
-                    victims.push_back(kv.first);
-                    if (victims.size() == need) break;
-                }
+            // Second pass: flush and erase some dirty pages if needed
+            for (auto e = ctx.cache.begin(); e != ctx.cache.end() && evicted < target; ) {
+                if (e->first.shape == k.shape && e->first.page == k.page) { ++e; continue; }
+                if (e->second.dirty) {
+                    flush_page(ctx, e->first.shape, e->first.page);
+                    e = ctx.cache.erase(e);
+                    ++evicted;
+                } else ++e;
             }
-            omp_unset_lock(&ctx.cache_lock);
-
-            for (const Key& vk : victims) flush_page(ctx, vk.shape, vk.page);
-
-            omp_set_lock(&ctx.cache_lock);
-            for (const Key& vk : victims) {
-                auto e = ctx.cache.find(vk);
-                if (e != ctx.cache.end() && !e->second.dirty) ctx.cache.erase(e);
-            }
-            omp_unset_lock(&ctx.cache_lock);
         }
     }
-
-    omp_set_lock(&ctx.cache_lock);
-    PageBuf& out = ctx.cache.find(k)->second;
-    omp_unset_lock(&ctx.cache_lock);
-    return out;
-
+    return *ref;
 }
 
 inline bool set_bit(Context& ctx,
@@ -318,9 +236,6 @@ inline bool set_bit(Context& ctx,
 {
     PageBuf& pb = ensure_cached(ctx, shape, page_id);
 
-    // Per-page spin
-    while (pb.lock.test_and_set(std::memory_order_acquire)) { /* spin */ }
-
     const std::uint32_t wi = bit_in_page >> 6;
     const std::uint32_t bi = bit_in_page & 63u;
     const std::uint64_t m  = 1ULL << bi;
@@ -328,8 +243,6 @@ inline bool set_bit(Context& ctx,
     const std::uint64_t old = pb.w[wi];
     const bool was_new = (old & m) == 0;
     if (was_new) { pb.w[wi] = old | m; pb.dirty = true; }
-
-    pb.lock.clear(std::memory_order_release);
     return was_new;
 }
 

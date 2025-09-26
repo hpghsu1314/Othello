@@ -8,15 +8,21 @@
 #include <cstring>   // memcpy
 #include <algorithm> // min
 #include <functional>
+#include <omp.h>
 
 #include "utilities.hpp"  // owner_of_shape(...)
 #include "page_ops.hpp"   // pageops::Context, pages_init, set_bit, ...
 #include "othello6.hpp"   // swap to othello4.hpp when running 4x4
 
 // Throughput knobs (correctness does not depend on specific values)
-static constexpr int BATCH_MAX  = 4096; // send/recv chunk size
-static constexpr int SEND_DEPTH = 4;    // in-flight slots per destination
+static constexpr int BATCH_MAX  = 4096*2; // send/recv chunk size
+static constexpr int SEND_DEPTH = 8;    // in-flight slots per destination
 static constexpr int TAG_HITS   = 1;
+
+// How often to (re)kick a non-blocking global check if nothing else triggers it.
+static constexpr int REDUCE_INTERVAL_ITERS = 128;
+// If we've had this many consecutive idle loops, kick a non-blocking reduce even sooner.
+static constexpr int IDLE_TRIGGER_ITERS    = 8;
 
 #pragma pack(push,1)
 struct HitMsg {
@@ -32,6 +38,7 @@ struct Outgoing {
     std::array<MPI_Request, SEND_DEPTH> reqs;
     // Small staging per destination; non-blocking pumps keep it small
     std::vector<HitMsg> staging;
+    std::size_t head = 0;
 };
 
 // ---- MPI datatype for HitMsg (portable) ----
@@ -67,11 +74,9 @@ static inline HitMsg make_HitMsg_from_pos(const game::Encoding& position) noexce
     return m;
 }
 
-// ---- Reap one free slot non-blocking; return slot index or -1 ----
 static inline int reap_one_free_slot_nb(Outgoing& o) {
-    for (int k = 0; k < SEND_DEPTH; ++k) {
+    for (int k = 0; k < SEND_DEPTH; ++k)
         if (o.reqs[k] == MPI_REQUEST_NULL && o.bufs[k].empty()) return k;
-    }
     int index = MPI_UNDEFINED, flag = 0;
     MPI_Testany(SEND_DEPTH, o.reqs.data(), &index, &flag, MPI_STATUS_IGNORE);
     if (flag && index != MPI_UNDEFINED) {
@@ -82,22 +87,26 @@ static inline int reap_one_free_slot_nb(Outgoing& o) {
     return -1;
 }
 
-// ---- Try to send one chunk (non-blocking). If no slot, just return. ----
 static inline void try_send_dest_nb(Outgoing& o, int dest,
                                     MPI_Datatype HIT_T, int tag,
                                     unsigned long long& sent_hits)
 {
-    if (o.staging.empty()) return;
+    // nothing staged or fully drained
+    if (o.head >= o.staging.size()) {
+        o.staging.clear();
+        o.head = 0;
+        return;
+    }
 
     int slot = reap_one_free_slot_nb(o);
     if (slot < 0) return;
 
-    const int n = (int)std::min<std::size_t>(o.staging.size(), (std::size_t)BATCH_MAX);
-    o.bufs[slot].resize(n);
-    std::memcpy(o.bufs[slot].data(), o.staging.data(), n * sizeof(HitMsg));
+    const std::size_t avail = o.staging.size() - o.head;
+    const int n = (int)std::min<std::size_t>(avail, (std::size_t)BATCH_MAX);
 
-    if ((int)o.staging.size() == n) o.staging.clear();
-    else o.staging.erase(o.staging.begin(), o.staging.begin() + n);
+    o.bufs[slot].resize(n);
+    std::memcpy(o.bufs[slot].data(), o.staging.data() + o.head, n * sizeof(HitMsg));
+    o.head += (std::size_t)n;
 
     MPI_Isend(o.bufs[slot].data(), n, HIT_T, dest, tag, MPI_COMM_WORLD, &o.reqs[slot]);
     sent_hits += (unsigned long long)n;
@@ -194,7 +203,7 @@ int main(int argc, char** argv) {
         auto& ctx = ctx_by_tier[tier];
         if (!ctx.inited) pageops::pages_init(ctx, R, tier, "data");
         return ctx;
-    };
+    };    
 
     // One wildcard Irecv buffer
     std::vector<HitMsg> rxbuf(BATCH_MAX);
@@ -211,8 +220,7 @@ int main(int argc, char** argv) {
     unsigned long long how_many_pos = 0;
 
     // Process a single self-dest hit and expand iteratively (DFS-like).
-    // IMPORTANT CHANGE: we NEVER call MPI here anymore. We only push remote
-    // children into per-destination staging; the main loop ships them.
+    // (No MPI here; only stage for remote destinations.)
     auto process_self_iter = [&](const HitMsg& seed) {
         std::vector<HitMsg> stack;
         stack.reserve(1024);
@@ -229,6 +237,10 @@ int main(int argc, char** argv) {
                 continue; // already seen
 
             ++how_many_pos;
+            if ((how_many_pos % 100000) == 0) {
+                printf("Rank %d has found %llu\n", R, how_many_pos);
+                fflush(stdout);
+            }
 
             const std::uint64_t h =
                 ((std::uint64_t)msg.page << pageops::PAGE_BITS) |
@@ -246,7 +258,7 @@ int main(int argc, char** argv) {
                     if (dest == R) {
                         stack.emplace_back(m2); // keep processing locally
                     } else {
-                        out[dest].staging.emplace_back(m2); // NO MPI here
+                        out[dest].staging.emplace_back(m2); // stage only
                     }
                 }
             } else {
@@ -256,13 +268,13 @@ int main(int argc, char** argv) {
                 if (dest == R) {
                     stack.emplace_back(m2);
                 } else {
-                    out[dest].staging.emplace_back(m2); // NO MPI here
+                    out[dest].staging.emplace_back(m2); // stage only
                 }
             }
         }
     };
 
-    // Batch handler: route each message (self -> process now; remote children are staged)
+    // Batch handler: route each message
     handle_batch = [&](const HitMsg* msgs, int n) {
         for (int i = 0; i < n; ++i) {
             const HitMsg& m = msgs[i];
@@ -270,7 +282,7 @@ int main(int argc, char** argv) {
             if (dest == R) {
                 process_self_iter(m);
             } else {
-                out[dest].staging.emplace_back(m); // NO MPI here
+                out[dest].staging.emplace_back(m); // stage only
             }
         }
     };
@@ -282,12 +294,48 @@ int main(int argc, char** argv) {
         if (dest0 == R) {
             process_self_iter(m0);
         } else {
-            out[dest0].staging.emplace_back(m0); // NO MPI here
+            out[dest0].staging.emplace_back(m0); // stage only
         }
     }
 
+    // ---- Non-blocking global check plumbing ----
+    // We reduce three values at once via MPI_SUM: [Σsent, Σrecv, Σlocal_active]
+    // local vector and global result
+    unsigned long long local_vec[3]  = {0ULL, 0ULL, 0ULL};
+    unsigned long long global_vec[3] = {0ULL, 0ULL, 0ULL};
+    MPI_Request        red_req       = MPI_REQUEST_NULL;
+    bool               reduce_in_flight = false;
+
+    auto kick_reduce_nb = [&] (int local_active) {
+        if (reduce_in_flight) return; // don't start a new one until previous completes
+        local_vec[0] = sent_hits;
+        local_vec[1] = recv_hits;
+        local_vec[2] = (unsigned long long)local_active; // 0 or 1
+        MPI_Iallreduce(local_vec, global_vec, 3, MPI_UNSIGNED_LONG_LONG,
+                       MPI_SUM, MPI_COMM_WORLD, &red_req);
+        reduce_in_flight = true;
+    };
+
+    auto poll_reduce_nb = [&] (unsigned long long& g_sent, unsigned long long& g_recv,
+                               int& any_active, int& completed) {
+        completed = 0;
+        if (!reduce_in_flight) return;
+        int done = 0;
+        MPI_Test(&red_req, &done, MPI_STATUS_IGNORE);
+        if (done) {
+            reduce_in_flight = false;
+            g_sent = global_vec[0];
+            g_recv = global_vec[1];
+            any_active = (global_vec[2] > 0ULL) ? 1 : 0;
+            completed = 1;
+        }
+    };
+
     // Main progress loop
     int global_continue = 1;
+    int iter = 0;
+    int idle_spins = 0;
+
     do {
         // Drain MPI receives (expands self work immediately, stages remote work)
         int rx_progress = progress_receives(rxbuf, rxreq, HIT_T, TAG_HITS, handle_batch, recv_hits);
@@ -302,18 +350,38 @@ int main(int argc, char** argv) {
         int incoming_ready = 0;
         MPI_Iprobe(MPI_ANY_SOURCE, TAG_HITS, MPI_COMM_WORLD, &incoming_ready, MPI_STATUS_IGNORE);
 
-        // Global in-flight credits
-        unsigned long long g_sent = 0ULL, g_recv = 0ULL;
-        MPI_Allreduce(&sent_hits, &g_sent, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-        MPI_Allreduce(&recv_hits, &g_recv, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-
         // Local activity (self work is processed immediately; only remote buffers left)
         int local_active = (rx_progress || tx_progress || have_work(out) || incoming_ready) ? 1 : 0;
-        int any_active = 0;
-        MPI_Allreduce(&local_active, &any_active, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
 
-        global_continue = (any_active || (g_sent != g_recv)) ? 1 : 0;
+        if (local_active) {
+            idle_spins = 0;
+        } else {
+            ++idle_spins;
+        }
+
+        // Kick a non-blocking global check occasionally or when idle for a while
+        if ((iter % REDUCE_INTERVAL_ITERS) == 0 || idle_spins >= IDLE_TRIGGER_ITERS) {
+            kick_reduce_nb(local_active);
+        }
+
+        // Poll any in-flight non-blocking reduction
+        unsigned long long g_sent = 0ULL, g_recv = 0ULL;
+        int any_active = 0, red_done = 0;
+        poll_reduce_nb(g_sent, g_recv, any_active, red_done);
+
+        // If we have a fresh global view, decide whether to continue
+        if (red_done) {
+            global_continue = (any_active || (g_sent != g_recv)) ? 1 : 0;
+        }
+
+        ++iter;
     } while (global_continue);
+
+    // Clean up any outstanding reduction request (should be null already, but just in case)
+    if (reduce_in_flight) {
+        MPI_Wait(&red_req, MPI_STATUS_IGNORE);
+        reduce_in_flight = false;
+    }
 
     // Drain & close
     for (int d = 0; d < W; ++d) {
