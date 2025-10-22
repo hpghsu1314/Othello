@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#include <algorithm> 
+#include <ranges>     
+#include <vector> 
 
 namespace bitops6 {
 
@@ -99,5 +102,34 @@ namespace bitops6 {
         return res;
     }
 
+    inline bool all_losing(const std::vector<uint8_t>& v) {
+        auto is_losing = [](uint8_t n) {
+            std::uint8_t msb2 = n >> 6;
+            return msb2 == (0b01000000 >> 6); // LOSE >> 6
+        };
+        return std::all_of(v.begin(), v.end(), is_losing);
+    }
+
+    inline bool tie_exists(const std::vector<uint8_t>& v) {
+        auto has_tie = [](uint8_t n) {
+            std::uint8_t msb2 = n >> 6;
+            return msb2 == (0b10000000 >> 6); // DRAW >> 6
+        };
+        return std::any_of(v.begin(), v.end(), has_tie);
+    }
+
+    inline std::uint8_t find_closest_prim(const std::vector<uint8_t>& v) {
+        std::uint8_t result = std::ranges::min(v | std::views::transform([](std::uint8_t x) {
+            return x & ((1<<5) - 1); 
+        }));
+        return result;
+    }
+
+    inline std::uint8_t find_farthest_prim(const std::vector<uint8_t>& v) {
+        std::uint8_t result = std::ranges::max(v | std::views::transform([](std::uint8_t x) {
+            return x & ((1<<5) - 1); 
+        }));
+        return result;
+    }
 
 }

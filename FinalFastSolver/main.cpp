@@ -9,9 +9,14 @@
 #include <algorithm> // min
 #include <functional>
 #include <omp.h>
+#include <chrono>
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <mutex>
+#include "page_ops.hpp"
 
 #include "utilities.hpp"  // owner_of_shape(...)
-#include "page_ops.hpp"   // pageops::Context, pages_init, set_bit, ...
 #include "othello6.hpp"   // swap to othello4.hpp when running 4x4
 
 // Throughput knobs (correctness does not depend on specific values)
@@ -40,6 +45,49 @@ struct Outgoing {
     std::vector<HitMsg> staging;
     std::size_t head = 0;
 };
+
+// --- timing utility ---
+struct TimerAggregator {
+    std::unordered_map<std::string, double> totals;
+    std::unordered_map<std::string, std::size_t> counts;
+    std::mutex mtx;
+
+    static TimerAggregator& instance() {
+        static TimerAggregator agg;
+        return agg;
+    }
+
+    void add(const std::string& name, double sec) {
+        std::lock_guard<std::mutex> lock(mtx);
+        totals[name] += sec;
+        counts[name] += 1;
+    }
+
+    void report() {
+        std::cout << "\n=== Timing summary ===\n";
+        for (auto& kv : totals) {
+            const std::string& name = kv.first;
+            double total = kv.second;
+            std::size_t n = counts[name];
+            std::cout << name << ": "
+                    << total << " s total, "
+                    << (total / n) << " s avg over "
+                    << n << " calls\n";
+        }
+    }
+};
+
+// wrapper for timing blocks
+template <typename Func>
+auto time_block(const std::string& name, Func&& f) {
+    auto start = std::chrono::high_resolution_clock::now();
+    auto result = f();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double> diff = end - start;
+    TimerAggregator::instance().add(name, diff.count());
+    return result;
+}
 
 // ---- MPI datatype for HitMsg (portable) ----
 static inline MPI_Datatype make_HitMsg_type() {
@@ -200,8 +248,15 @@ int main(int argc, char** argv) {
     // Per-tier page contexts (lazy init)
     pageops::Context ctx_by_tier[game::MAX_TIER + 1] = {};
     auto get_ctx = [&](std::uint8_t tier) -> pageops::Context& {
+        if (tier > game::MAX_TIER) {
+            std::fprintf(stderr, "Error: tier %d exceeds MAX_TIER %d\n", tier, game::MAX_TIER);
+            std::exit(1);
+        }
         auto& ctx = ctx_by_tier[tier];
-        if (!ctx.inited) pageops::pages_init(ctx, R, tier, "data");
+        if (!ctx.inited) {
+            std::printf("Rank %d: Initializing context for tier %d\n", R, tier);
+            pageops::pages_init(ctx, R, tier, "data");
+        }
         return ctx;
     };    
 
@@ -238,21 +293,28 @@ int main(int argc, char** argv) {
 
             ++how_many_pos;
             if ((how_many_pos % 100000) == 0) {
-                printf("Rank %d has found %llu\n", R, how_many_pos);
+                // printf("Rank %d has found %llu\n", R, how_many_pos);
                 fflush(stdout);
+                TimerAggregator::instance().report();
             }
 
             const std::uint64_t h =
                 ((std::uint64_t)msg.page << pageops::PAGE_BITS) |
                  (std::uint64_t)msg.bit;
-            game::Encoding pos = game::unhash(msg.shape, h);
+            game::Encoding pos = time_block("unhash", [&] {
+                return game::unhash(msg.shape, h);
+            });
 
-            std::uint64_t moves = game::legal_moves(pos);
+            std::uint64_t moves = time_block("legal_moves", [&] {
+                return game::legal_moves(pos);
+            });
             if (moves) {
                 while (moves) {
                     std::uint64_t mv = moves & -moves;
                     moves ^= mv;
-                    const game::Encoding nxt = game::flip(game::do_move(pos, mv));
+                    const game::Encoding nxt = time_block("do_move+flip", [&] {
+                        return game::flip(game::do_move(pos, mv));
+                    });
                     const HitMsg m2 = make_HitMsg_from_pos(nxt);
                     const int dest = owner_of_shape(m2.shape, W);
                     if (dest == R) {
@@ -282,14 +344,20 @@ int main(int argc, char** argv) {
             if (dest == R) {
                 process_self_iter(m);
             } else {
-                out[dest].staging.emplace_back(m); // stage only
+                out[dest].staging.emplace_back(m); // stage onlyx
             }
         }
     };
 
+    // Near-terminal position: 
+    game::Encoding test = {
+        0b0000000000000000000000000000111111100001100001100001100001111110, // player (P)
+        0b0000000000000000000000000000000000011110011110011110011110000000  // opponent (O)
+    };
+
     // Seed from rank 0
     if (R == 0) {
-        const HitMsg m0 = make_HitMsg_from_pos(game::starting_position());
+        const HitMsg m0 = make_HitMsg_from_pos(test); // instead of starting position
         const int dest0 = owner_of_shape(m0.shape, W);
         if (dest0 == R) {
             process_self_iter(m0);
@@ -362,8 +430,14 @@ int main(int argc, char** argv) {
         // Kick a non-blocking global check occasionally or when idle for a while
         if ((iter % REDUCE_INTERVAL_ITERS) == 0 || idle_spins >= IDLE_TRIGGER_ITERS) {
             kick_reduce_nb(local_active);
+            // printf("[Rank %d][Iter %d] recv: %f (%ld calls), pump: %f (%ld calls), send: %f (%ld calls)\n",
+            //    R, iter,
+            //    time_recv, calls_recv,
+            //    time_pump, calls_pump,
+            //    time_send, calls_send);
+            fflush(stdout);
         }
-
+        
         // Poll any in-flight non-blocking reduction
         unsigned long long g_sent = 0ULL, g_recv = 0ULL;
         int any_active = 0, red_done = 0;
@@ -397,19 +471,47 @@ int main(int argc, char** argv) {
         o.staging.shrink_to_fit();
     }
 
+    // Store which tiers were initialized and flush data to disk
+    std::vector<unsigned> initialized_tiers;
     for (unsigned t = 0; t <= game::MAX_TIER; ++t) {
         if (ctx_by_tier[t].inited) {
+            initialized_tiers.push_back(t);
             pageops::flush_all(ctx_by_tier[t]);
-            pageops::pages_close(ctx_by_tier[t]);
         }
     }
 
-    std::printf("%llu\n", (unsigned long long)how_many_pos);
+    // Solving stage - immediately after exploration, before MPI cleanup
+    std::printf("Rank %d: Starting solving stage\n", R);
+    for (unsigned t : initialized_tiers) {
+        std::printf("Rank %d: Solving tier %u\n", R, t);
+        pageops::solve_page(ctx_by_tier[t], get_ctx);
+        std::printf("Rank %d: Finished tier %u\n", R, t);
+    }
+    std::printf("Rank %d: Finished solving stage\n", R);
 
-    // Tear down receive
+    // Close all contexts after solving
+    std::printf("Rank %d: Closing all contexts\n", R);
+    for (unsigned t : initialized_tiers) {
+        if (ctx_by_tier[t].inited) {
+            std::printf("Rank %d: Closing context for tier %u\n", R, t);
+            pageops::pages_close(ctx_by_tier[t]);
+        }
+    }
+    std::printf("Rank %d: All contexts closed\n", R);
+
+    // Tear down MPI communication
     MPI_Cancel(&rxreq);
     MPI_Request_free(&rxreq);
     MPI_Type_free(&HIT_T);
+
+    // std::printf("%llu\n", (unsigned long long)how_many_pos);
+
     MPI_Finalize();
     return 0;
 }
+
+// mpic++ -std=c++20 -O3 -march=native -DNDEBUG -Wall -Wextra \
+//     -I/opt/homebrew/opt/libomp/include \
+//     -L/opt/homebrew/opt/libomp/lib -lomp \
+//     -o othello6 main.cpp
+// mpirun -np 8 ./othello6    

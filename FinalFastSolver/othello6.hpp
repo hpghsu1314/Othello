@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include "bitops6.hpp"
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
   #include <immintrin.h>  // for _pext_u64 / _pdep_u64 (BMI2)
 #endif
@@ -226,7 +227,7 @@ namespace game {
         const Bitboard sh = shape(s);
     #if defined(__BMI2__)
         return _pext_u64(s.player, sh);
-    #else
+    #else   
         // Portable fallback: iterate set bits of sh (in index order) and pack.
         std::uint64_t h = 0;
         std::uint64_t pos = 0;
