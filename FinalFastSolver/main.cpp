@@ -10,11 +10,12 @@
 #include <functional>
 #include <omp.h>
 #include <chrono>
-#include <iostream>
+#include <iostream> 
 #include <string>
 #include <unordered_map>
 #include <mutex>
 #include "page_ops.hpp"
+#include "message.hpp"
 
 #include "utilities.hpp"  // owner_of_shape(...)
 #include "othello6.hpp"   // swap to othello4.hpp when running 4x4
@@ -23,19 +24,13 @@
 static constexpr int BATCH_MAX  = 4096*2; // send/recv chunk size
 static constexpr int SEND_DEPTH = 8;    // in-flight slots per destination
 static constexpr int TAG_HITS   = 1;
+static constexpr int TAG_MODULE_TO_MAIN = 2;
+static constexpr int TAG_MAIN_TO_MODULE = 3;
 
 // How often to (re)kick a non-blocking global check if nothing else triggers it.
 static constexpr int REDUCE_INTERVAL_ITERS = 128;
 // If we've had this many consecutive idle loops, kick a non-blocking reduce even sooner.
 static constexpr int IDLE_TRIGGER_ITERS    = 8;
-
-#pragma pack(push,1)
-struct HitMsg {
-    std::uint64_t shape;
-    std::uint32_t page;
-    std::uint32_t bit;
-};
-#pragma pack(pop)
 
 struct Outgoing {
     // In-flight send slots (never modify a buf while its req != MPI_REQUEST_NULL)
@@ -225,6 +220,27 @@ static inline int progress_receives(std::vector<HitMsg>& rxbuf, MPI_Request& rxr
     return progressed;
 }
 
+static inline int progress_receives_tier(std::vector<TierMsg>& rxbuf, MPI_Request& rxreq,
+                                    MPI_Datatype TIER_T,
+                                    const std::function<void(const TierMsg*, int, int)>& handle_batch)
+{
+    int progressed = 0;
+    for (;;) {
+        int done = 0; MPI_Status st;
+        MPI_Test(&rxreq, &done, &st);
+        if (!done) break;
+
+        int count = 0; MPI_Get_count(&st, TIER_T, &count);
+        if (count > 0) {
+            handle_batch(rxbuf.data(), count, st.MPI_SOURCE);
+            progressed = 1;
+        }
+        MPI_Irecv(rxbuf.data(), (int)rxbuf.size(), TIER_T, MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN,
+                  MPI_COMM_WORLD, &rxreq);
+    }
+    return progressed;
+}
+
 int main(int argc, char** argv) {
     int provided = 0;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
@@ -272,6 +288,7 @@ int main(int argc, char** argv) {
 
     // Forward declare batch handler; self-processing is iterative (no recursion)
     std::function<void(const HitMsg*, int)> handle_batch;
+    std::function<void(const TierMsg*, int, int)> handle_batch_tier;
     unsigned long long how_many_pos = 0;
 
     // Process a single self-dest hit and expand iteratively (DFS-like).
@@ -351,13 +368,16 @@ int main(int argc, char** argv) {
 
     // Near-terminal position: 
     game::Encoding test = {
-        0b0000000000000000000000000000111111100001100001100001100001111110, // player (P)
-        0b0000000000000000000000000000000000011110011110011110011110000000  // opponent (O)
+        0b0000000000000000000000000000111111100001100001100001100001111110,  // Player (P)
+        0b0000000000000000000000000000000000011110011110011110011110000000  // player (O)
     };
+
+
 
     // Seed from rank 0
     if (R == 0) {
         const HitMsg m0 = make_HitMsg_from_pos(test); // instead of starting position
+        printf("actual result: %llu, %u, %u \n", m0.shape, m0.page, m0.bit);
         const int dest0 = owner_of_shape(m0.shape, W);
         if (dest0 == R) {
             process_self_iter(m0);
@@ -471,22 +491,86 @@ int main(int argc, char** argv) {
         o.staging.shrink_to_fit();
     }
 
+    // --------------------------------------------------------------------------------- Solving Tier ---------------------------------------------------------------------------------
+
     // Store which tiers were initialized and flush data to disk
     std::vector<unsigned> initialized_tiers;
-    for (unsigned t = 0; t <= game::MAX_TIER; ++t) {
+    for (int t = game::MAX_TIER; t >= 0; --t) {
         if (ctx_by_tier[t].inited) {
             initialized_tiers.push_back(t);
             pageops::flush_all(ctx_by_tier[t]);
         }
     }
 
-    // Solving stage - immediately after exploration, before MPI cleanup
+    std::vector<std::uint8_t> persisted_values;
+    std::vector<MPI_Request> persisted_reqs;
+    std::uint8_t update_tier[game::MAX_TIER + 1] = {0};
+    std::uint8_t local_tier[game::MAX_TIER + 1] = {0};
+    std::uint8_t global_tier[game::MAX_TIER + 1] = {0};
+    MPI_Request        tier_req       = MPI_REQUEST_NULL;
+    bool tiers_in_flight = false;
+
+    auto kick_tier_reduce_nb = [&]() {
+        if (tiers_in_flight) return;
+        std::memcpy(local_tier, update_tier, game::MAX_TIER + 1);
+        MPI_Iallreduce(local_tier, global_tier, game::MAX_TIER + 1, MPI_UINT8_T, MPI_LAND, MPI_COMM_WORLD, &tier_req);
+        tiers_in_flight = true;
+    };
+
+    auto poll_tier_reduce_b = [&]() {
+        if (!tiers_in_flight) {
+            kick_tier_reduce_nb();
+            return;
+        }
+        MPI_Wait(&tier_req, MPI_STATUS_IGNORE);
+        tiers_in_flight = false;
+    };
+
+    handle_batch_tier = [&](const TierMsg* msgs, int n, int recipient) {
+        for (int i = 0; i < n; i++) {
+            const TierMsg& m = msgs[i];
+            printf("receive side -- shape: %llu, page: %u, bit: %u, tier: %hhu \n", m.shape, m.page, m.bit, m.tier);
+            persisted_values.push_back(pageops::read_solved_value(m.shape, m.page, m.bit, ctx_by_tier[m.tier]));
+            persisted_reqs.push_back(MPI_REQUEST_NULL);
+            MPI_Isend(&persisted_values.back(), 1, MPI_UINT8_T, recipient, TAG_MAIN_TO_MODULE, MPI_COMM_WORLD, &persisted_reqs.back());
+        }
+    };
+
+    MPI_Datatype TIER_T = pageops::make_TierMsg_type();
+    std::vector<TierMsg> trbuf(BATCH_MAX); 
+    MPI_Request trreq;
+
+    // Todo: clear rec buffers, clear persisted data on both main and module side, core collisions for solving/reading
+
+    MPI_Irecv(trbuf.data(), (int)trbuf.size(), TIER_T, MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN,
+              MPI_COMM_WORLD, &trreq);
+
+    int ct = game::MAX_TIER;
+    bool tiers_solved = false;
+
     std::printf("Rank %d: Starting solving stage\n", R);
-    for (unsigned t : initialized_tiers) {
-        std::printf("Rank %d: Solving tier %u\n", R, t);
-        pageops::solve_page(ctx_by_tier[t], get_ctx);
-        std::printf("Rank %d: Finished tier %u\n", R, t);
-    }
+    do {        
+        int incoming_ready = 0;
+        MPI_Iprobe(MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN, MPI_COMM_WORLD, &incoming_ready, MPI_STATUS_IGNORE);
+        progress_receives_tier(trbuf, trreq, TIER_T, handle_batch_tier);
+
+        if (ct >= 0) {
+            if (!ctx_by_tier[ct].inited) {
+                update_tier[ct] = true;
+                ct--;
+            } else if (ct == game::MAX_TIER || global_tier[ct + 1]) {
+                pageops::solve_page(ctx_by_tier, ct, MPI_COMM_WORLD);
+                update_tier[ct] = true;
+                ct--;
+                std::printf("Rank %d: Finished tier %u\n", R, ct);
+            }
+        }
+        progress_receives_tier(trbuf, trreq, TIER_T, handle_batch_tier);
+        poll_tier_reduce_b();
+        
+        tiers_solved = std::all_of(std::begin(global_tier), std::end(global_tier), [](bool x) { return x; }) && !incoming_ready;
+    } while (!tiers_solved);  
+
     std::printf("Rank %d: Finished solving stage\n", R);
 
     // Close all contexts after solving
