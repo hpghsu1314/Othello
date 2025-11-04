@@ -452,7 +452,8 @@ inline void solve_pos(Context (&ctx_by_tier)[game::MAX_TIER + 1],
                 continue;
             }
 
-            MPI_Isend(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm, child_send_requests.data() + head); 
+            MPI_Send(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm);
+            printf("reached past the send request blocking \n"); 
             MPI_Irecv(children.data() + head, 1, MPI_UINT8_T, dest, TAG_MAIN_TO_MODULE, comm, child_req_requests.data() + head);
             head++;
         }
@@ -470,7 +471,7 @@ inline void solve_pos(Context (&ctx_by_tier)[game::MAX_TIER + 1],
             }
             child_send_requests[head] = child_req_requests[head] = MPI_REQUEST_NULL;
         } else {
-            MPI_Isend(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm, child_send_requests.data() + head);
+            MPI_Send(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm);
             MPI_Irecv(children.data() + head, 1, MPI_UINT8_T, dest, TAG_MAIN_TO_MODULE, comm, child_req_requests.data() + head);
         }
     }

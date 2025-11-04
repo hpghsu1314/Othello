@@ -26,6 +26,7 @@ static constexpr int SEND_DEPTH = 8;    // in-flight slots per destination
 static constexpr int TAG_HITS   = 1;
 static constexpr int TAG_MODULE_TO_MAIN = 2;
 static constexpr int TAG_MAIN_TO_MODULE = 3;
+static constexpr int TAG_SEND_TOKEN = 4;
 
 // How often to (re)kick a non-blocking global check if nothing else triggers it.
 static constexpr int REDUCE_INTERVAL_ITERS = 128;
@@ -210,6 +211,7 @@ static inline int progress_receives(std::vector<HitMsg>& rxbuf, MPI_Request& rxr
 
         int count = 0; MPI_Get_count(&st, HIT_T, &count);
         if (count > 0) {
+            printf("progressing receives here \n");
             handle_batch(rxbuf.data(), count);
             recv_hits += (unsigned long long)count;
             progressed = 1;
@@ -230,6 +232,7 @@ static inline int progress_receives_tier(std::vector<TierMsg>& rxbuf, MPI_Reques
         MPI_Test(&rxreq, &done, &st);
         if (!done) break;
 
+        printf("recieved data from module side \n");
         int count = 0; MPI_Get_count(&st, TIER_T, &count);
         if (count > 0) {
             handle_batch(rxbuf.data(), count, st.MPI_SOURCE);
@@ -532,43 +535,66 @@ int main(int argc, char** argv) {
             printf("receive side -- shape: %llu, page: %u, bit: %u, tier: %hhu \n", m.shape, m.page, m.bit, m.tier);
             persisted_values.push_back(pageops::read_solved_value(m.shape, m.page, m.bit, ctx_by_tier[m.tier]));
             persisted_reqs.push_back(MPI_REQUEST_NULL);
-            MPI_Isend(&persisted_values.back(), 1, MPI_UINT8_T, recipient, TAG_MAIN_TO_MODULE, MPI_COMM_WORLD, &persisted_reqs.back());
+            MPI_Send(&persisted_values.back(), 1, MPI_UINT8_T, recipient, TAG_MAIN_TO_MODULE, MPI_COMM_WORLD);
         }
     };
 
     MPI_Datatype TIER_T = pageops::make_TierMsg_type();
     std::vector<TierMsg> trbuf(BATCH_MAX); 
-    MPI_Request trreq;
-
-    // Todo: clear rec buffers, clear persisted data on both main and module side, core collisions for solving/reading
+    MPI_Request trreq = MPI_REQUEST_NULL;
 
     MPI_Irecv(trbuf.data(), (int)trbuf.size(), TIER_T, MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN,
               MPI_COMM_WORLD, &trreq);
+    
+    int token = (R == 0) ? 1 : 0;
+    MPI_Request tk_rec_req = MPI_REQUEST_NULL;
 
     int ct = game::MAX_TIER;
     bool tiers_solved = false;
 
     std::printf("Rank %d: Starting solving stage\n", R);
-    do {        
-        int incoming_ready = 0;
-        MPI_Iprobe(MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN, MPI_COMM_WORLD, &incoming_ready, MPI_STATUS_IGNORE);
+    do {
         progress_receives_tier(trbuf, trreq, TIER_T, handle_batch_tier);
 
+        if (tk_rec_req != MPI_REQUEST_NULL) {
+            int flag = 0;
+            MPI_Test(&tk_rec_req, &flag, MPI_STATUS_IGNORE);
+            if (flag) tk_rec_req = MPI_REQUEST_NULL;
+        }
+        
         if (ct >= 0) {
             if (!ctx_by_tier[ct].inited) {
                 update_tier[ct] = true;
                 ct--;
-            } else if (ct == game::MAX_TIER || global_tier[ct + 1]) {
+            } else if (ct == game::MAX_TIER) {
                 pageops::solve_page(ctx_by_tier, ct, MPI_COMM_WORLD);
                 update_tier[ct] = true;
+                std::printf("Rank %d: Finished solving tier %d \n", R, ct);
                 ct--;
-                std::printf("Rank %d: Finished tier %u\n", R, ct);
+            } else if (global_tier[ct + 1]) {
+                printf("Rank %d: currently has token %d \n", R, token);
+                if (token) {
+                    pageops::solve_page(ctx_by_tier, ct, MPI_COMM_WORLD);
+                    update_tier[ct] = true;
+                    std::printf("Rank %d: Finished solving tier %d \n", R, ct);
+                    ct--;
+                    MPI_Send(&token, 1, MPI_INT, (R + 1)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD);
+                    token = 0;
+                }
             }
+        } 
+        
+        if (token) {
+            MPI_Send(&token, 1, MPI_INT, (R + 1)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD);
+            token = 0;
         }
+        
+        if (!token && tk_rec_req == MPI_REQUEST_NULL) MPI_Irecv(&token, 1, MPI_INT, (R - 1 + W)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD, &tk_rec_req);
+        
         progress_receives_tier(trbuf, trreq, TIER_T, handle_batch_tier);
         poll_tier_reduce_b();
         
-        tiers_solved = std::all_of(std::begin(global_tier), std::end(global_tier), [](bool x) { return x; }) && !incoming_ready;
+        tiers_solved = std::all_of(std::begin(global_tier), std::end(global_tier), [](bool x) { return x; });
     } while (!tiers_solved);  
 
     std::printf("Rank %d: Finished solving stage\n", R);
@@ -586,7 +612,12 @@ int main(int argc, char** argv) {
     // Tear down MPI communication
     MPI_Cancel(&rxreq);
     MPI_Request_free(&rxreq);
+    MPI_Cancel(&trreq);
+    MPI_Request_free(&trreq);
+    MPI_Cancel(&tk_rec_req);
+    MPI_Request_free(&tk_rec_req);
     MPI_Type_free(&HIT_T);
+    MPI_Type_free(&TIER_T);
 
     // std::printf("%llu\n", (unsigned long long)how_many_pos);
 
