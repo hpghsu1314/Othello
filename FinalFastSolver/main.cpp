@@ -505,28 +505,33 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::vector<std::uint8_t> persisted_values;
-    std::vector<MPI_Request> persisted_reqs;
+    std::vector<std::uint8_t> persisted_values(BATCH_MAX);
+    std::vector<MPI_Request> persisted_reqs(BATCH_MAX);
     std::uint8_t update_tier[game::MAX_TIER + 1] = {0};
     std::uint8_t local_tier[game::MAX_TIER + 1] = {0};
     std::uint8_t global_tier[game::MAX_TIER + 1] = {0};
+    std::uint8_t stable_global_tier[game::MAX_TIER + 1] = {0};
     MPI_Request        tier_req       = MPI_REQUEST_NULL;
     bool tiers_in_flight = false;
 
     auto kick_tier_reduce_nb = [&]() {
         if (tiers_in_flight) return;
         std::memcpy(local_tier, update_tier, game::MAX_TIER + 1);
-        MPI_Iallreduce(local_tier, global_tier, game::MAX_TIER + 1, MPI_UINT8_T, MPI_LAND, MPI_COMM_WORLD, &tier_req);
+        MPI_Iallreduce(local_tier, stable_global_tier, game::MAX_TIER + 1, MPI_UINT8_T, MPI_LAND, MPI_COMM_WORLD, &tier_req);
         tiers_in_flight = true;
     };
 
-    auto poll_tier_reduce_b = [&]() {
+    auto poll_tier_reduce_nb = [&]() {
         if (!tiers_in_flight) {
             kick_tier_reduce_nb();
             return;
         }
-        MPI_Wait(&tier_req, MPI_STATUS_IGNORE);
-        tiers_in_flight = false;
+        int completed;
+        MPI_Test(&tier_req, &completed, MPI_STATUS_IGNORE);
+        if (completed) {
+            std::memcpy(global_tier, stable_global_tier, game::MAX_TIER + 1);
+            tiers_in_flight = false;
+        }
     };
 
     handle_batch_tier = [&](const TierMsg* msgs, int n, int recipient) {
@@ -541,7 +546,7 @@ int main(int argc, char** argv) {
 
     MPI_Datatype TIER_T = pageops::make_TierMsg_type();
     std::vector<TierMsg> trbuf(BATCH_MAX); 
-    MPI_Request trreq = MPI_REQUEST_NULL;
+    MPI_Request trreq;
 
     MPI_Irecv(trbuf.data(), (int)trbuf.size(), TIER_T, MPI_ANY_SOURCE, TAG_MODULE_TO_MAIN,
               MPI_COMM_WORLD, &trreq);
@@ -564,38 +569,29 @@ int main(int argc, char** argv) {
         
         if (ct >= 0) {
             if (!ctx_by_tier[ct].inited) {
-                update_tier[ct] = true;
+                update_tier[ct] = 1;
                 ct--;
-            } else if (ct == game::MAX_TIER) {
+            } else if (ct == game::MAX_TIER || (token && global_tier[ct + 1])) {
+                std::printf("Rank %d: Started solving tier %d \n", R, ct);
                 pageops::solve_page(ctx_by_tier, ct, MPI_COMM_WORLD);
-                update_tier[ct] = true;
+                update_tier[ct] = 1;
                 std::printf("Rank %d: Finished solving tier %d \n", R, ct);
                 ct--;
-            } else if (global_tier[ct + 1]) {
-                printf("Rank %d: currently has token %d \n", R, token);
-                if (token) {
-                    pageops::solve_page(ctx_by_tier, ct, MPI_COMM_WORLD);
-                    update_tier[ct] = true;
-                    std::printf("Rank %d: Finished solving tier %d \n", R, ct);
-                    ct--;
-                    MPI_Send(&token, 1, MPI_INT, (R + 1)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD);
-                    token = 0;
-                }
             }
-        } 
-        
+        }
+
         if (token) {
             MPI_Send(&token, 1, MPI_INT, (R + 1)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD);
             token = 0;
         }
-        
+
         if (!token && tk_rec_req == MPI_REQUEST_NULL) MPI_Irecv(&token, 1, MPI_INT, (R - 1 + W)%W, TAG_SEND_TOKEN, MPI_COMM_WORLD, &tk_rec_req);
-        
+
         progress_receives_tier(trbuf, trreq, TIER_T, handle_batch_tier);
-        poll_tier_reduce_b();
-        
-        tiers_solved = std::all_of(std::begin(global_tier), std::end(global_tier), [](bool x) { return x; });
-    } while (!tiers_solved);  
+        poll_tier_reduce_nb();
+
+        tiers_solved = std::all_of(std::begin(global_tier), std::end(global_tier), [](uint8_t x) { return x; });
+    } while (!tiers_solved);
 
     std::printf("Rank %d: Finished solving stage\n", R);
 
