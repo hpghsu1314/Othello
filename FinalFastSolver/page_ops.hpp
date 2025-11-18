@@ -43,8 +43,10 @@ struct KeyHash {
 
 #pragma pack(push,1)
 struct PageIdxRec { std::uint64_t shape; std::uint32_t page; std::uint64_t off; };
+struct ChildCacheRec { std::uint64_t hash; std::uint8_t value; };
 #pragma pack(pop)
 static_assert(sizeof(PageIdxRec)==20, "PageIdxRec must be 20 bytes");
+static_assert(sizeof(ChildCacheRec)==9, "ChildCacheRec must be 9 bytes");
 
 struct PageBuf {
     alignas(64) std::array<std::uint64_t, PAGE_QWORDS> w{};
@@ -56,6 +58,7 @@ struct PageBuf {
 
 using MetaMap  = std::unordered_map<std::uint64_t, std::unordered_map<Key, std::uint64_t, KeyHash>>; 
 using CacheMap = std::unordered_map<Key, PageBuf,   KeyHash>;
+using SolvedCacheMap = std::unordered_map<std::uint64_t, std::uint8_t>;
 
 template <typename Key>
 uint64_t* nested_find(MetaMap& map, std::uint64_t outer, const Key& inner_key)
@@ -74,17 +77,20 @@ struct Context {
     // Hot file handles (kept open)
     std::FILE* data = nullptr;  // pages.dat
     std::FILE* idx  = nullptr;  // pages.idx
-    std::FILE* solved = nullptr; // pages.solved
+    std::FILE* solved = nullptr; // pages.solved, per tier
+    std::FILE* child_cache = nullptr; // page.child_cache 
     std::size_t file_size = 0;  // current end of pages.dat (bytes)
 
     // Paths
     std::string data_path;
     std::string idx_path;
     std::string solved_path;
+    std::string child_cache_path;
 
     // In-RAM maps
     MetaMap  meta_map;          // tier -> (shape, page) -> offset
     CacheMap cache;             // (shape,page) -> page buffer (in-place, no moves/copies)
+    SolvedCacheMap tier_cache;             // offset -> value/remoteness
 
     // Cache size knob (pages)
     std::size_t cache_cap_pages = 4096u * 16u;
@@ -100,16 +106,18 @@ inline const std::uint8_t ZERO_PAGE[PAGE_BYTES] = {0};
 inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::string& root_dir) {
     if (ctx.inited) return;
 
-    char dir[512], dpath[512], ipath[512], spath[512];
+    char dir[512], dpath[512], ipath[512], spath[512], cpath[512];
     std::snprintf(dir,   sizeof(dir),   "%s/owner_%02d/tier_%02u", root_dir.c_str(), owner_num, tier);
     std::snprintf(dpath, sizeof(dpath), "%s/pages.dat", dir);
     std::snprintf(ipath, sizeof(ipath), "%s/pages.idx", dir);
     std::snprintf(spath, sizeof(spath), "%s/pages.solved", dir);
+    std::snprintf(cpath, sizeof(cpath), "%s/pages.child_cache", dir);
     fs::create_directories(dir);
 
     ctx.data_path = dpath;
     ctx.idx_path  = ipath;
     ctx.solved_path = spath;
+    ctx.child_cache_path = cpath;
 
     ctx.data = std::fopen(ctx.data_path.c_str(), "rb+");
     if (!ctx.data) ctx.data = std::fopen(ctx.data_path.c_str(), "wb+");
@@ -119,6 +127,10 @@ inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::st
     ctx.idx = std::fopen(ctx.idx_path.c_str(), "ab+");
     if (!ctx.idx) { std::perror("fopen pages.idx"); std::exit(1); }
     std::setvbuf(ctx.idx, nullptr, _IOFBF, 1<<20);
+
+    ctx.child_cache = std::fopen(ctx.child_cache_path.c_str(), "ab+");
+    if (!ctx.child_cache) { std::perror("fopen pages.child_cache"); std::exit(1); }
+    std::setvbuf(ctx.child_cache, nullptr, _IOFBF, 1<<20);
 
     ctx.solved = std::fopen(ctx.solved_path.c_str(), "rb+");
     if (!ctx.solved) ctx.solved = std::fopen(ctx.solved_path.c_str(), "wb+");
@@ -131,10 +143,39 @@ inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::st
     ctx.inited = true;
 }
 
+// ---------- global_db initialization ----------
+// Initialize the global_db file in the data directory (not owned by any particular rank)
+inline std::FILE* global_db_init(const std::string& root_dir) {
+    // Ensure data directory exists
+    fs::create_directories(root_dir);
+    
+    char gpath[512];
+    std::snprintf(gpath, sizeof(gpath), "%s/global_db", root_dir.c_str());
+    
+    // Open in append mode (ab+) - allows reading and appending
+    std::FILE* global_db = std::fopen(gpath, "ab+");
+    if (!global_db) {
+        std::perror("fopen global_db");
+        std::exit(1);
+    }
+    
+    std::setvbuf(global_db, nullptr, _IOFBF, 1<<20); // 1 MiB
+    return global_db;
+}
+
+inline void global_db_close(std::FILE*& global_db) {
+    if (global_db) {
+        std::fflush(global_db);
+        std::fclose(global_db);
+        global_db = nullptr;
+    }
+}
+
 inline void pages_flush(Context& ctx) {
     if (ctx.data) std::fflush(ctx.data);
     if (ctx.idx)  std::fflush(ctx.idx);
     if (ctx.solved) std::fflush(ctx.solved);
+    if (ctx.child_cache) std::fflush(ctx.child_cache);
 }
 
 inline void pages_close(Context& ctx) {
@@ -142,6 +183,7 @@ inline void pages_close(Context& ctx) {
     if (ctx.data) { std::fclose(ctx.data); ctx.data=nullptr; }
     if (ctx.idx)  { std::fclose(ctx.idx);  ctx.idx=nullptr;  }
     if (ctx.solved) { std::fclose(ctx.solved); ctx.solved=nullptr; }
+    if (ctx.child_cache) std::fflush(ctx.child_cache);
     ctx.inited = false;
 }
 
@@ -196,13 +238,11 @@ inline std::uint64_t ensure_page_exists_fast(Context& ctx,
     const std::uint64_t off = ctx.file_size;
     ctx.file_size += PAGE_BYTES;
 
-    auto it_outer = ctx.meta_map.find(game::tier_of(shape));   // look for existing outer key
-    if (it_outer != ctx.meta_map.end()) {       // only if outer exists
-        auto& inner_map = it_outer->second;     // reference to inner map
-        inner_map.try_emplace(k, off);          // insert inner key if missing
-    } else {
-        ctx.meta_map.emplace(game::tier_of(shape), MetaMap::mapped_type{{k, off}});
-    }
+    auto it_outer = ctx.meta_map.find(game::tier_of(shape));   
+    if (it_outer != ctx.meta_map.end()) {       
+        auto& inner_map = it_outer->second;     
+        inner_map.try_emplace(k, off);          
+    } else ctx.meta_map.emplace(game::tier_of(shape), MetaMap::mapped_type{{k, off}});
 
     // Write zero page at the reserved offset
     std::fseek(ctx.data, (long)off, SEEK_SET);
@@ -210,18 +250,16 @@ inline std::uint64_t ensure_page_exists_fast(Context& ctx,
         std::perror("fwrite pages.dat"); std::exit(1);
     }
 
+    std::fseek(ctx.solved, (long)(off << 3), SEEK_SET);
+    std::array<std::uint8_t, PAGE_BYTES> zeros{};
+    if (std::fwrite(zeros.data(), 1, (PAGE_BYTES << 3), ctx.solved) != (PAGE_BYTES << 3)) {
+        std::perror("fwrite pages.solved"); std::exit(1);
+    }
+
     // Append index record
     const PageIdxRec rec{shape, page_id, off};
     if (std::fwrite(&rec, 1, sizeof(rec), ctx.idx) != sizeof(rec)) {
         std::perror("fwrite pages.idx"); std::exit(1);
-    }
-
-    if (ctx.solved) {
-        std::fseek(ctx.solved, (long)(off << 3), SEEK_SET);
-        std::array<std::uint8_t, PAGE_BYTES> zeros{};
-        if (std::fwrite(zeros.data(), 1, (PAGE_BYTES << 3), ctx.solved) != (PAGE_BYTES << 3)) {
-            std::perror("fwrite pages.solved"); std::exit(1);
-        }
     }
 
     return off;
@@ -295,84 +333,22 @@ inline bool set_bit(Context& ctx,
     return was_new;
 }
 
-// ---------- solved values storage ----------
-
-inline void write_solved_value(Context& ctx, std::uint64_t shape, std::uint32_t page_id, 
-                               std::uint32_t bit_in_page, std::uint8_t value) {
-    if (!ctx.solved) {
-        std::fprintf(stderr, "Error: solved file not open on write\n");
-        return;
-    }
-    
-    const std::uint64_t page_offset = offset_of(ctx, shape, page_id);
-
-    printf("write page offset: %llu with bit in page %u\n", page_offset, bit_in_page);
-    const std::uint64_t solved_offset = (page_offset << 3) + bit_in_page;
-    if (std::fseek(ctx.solved, (long)solved_offset, SEEK_SET) != 0) {
-        std::perror("fseek solved file");
-        return;
-    }
-
-    printf("Writing file: %s \n", ctx.solved_path.c_str());
-    printf("Writing file (ptr): %p \n", ctx.solved);
-    printf("Writing this value: %d \n", value);
-    printf("Writing at this offset: %llu \n", solved_offset);
-    printf("write side -- shape: %llu, page: %u, bit: %u \n", shape, page_id, bit_in_page);
-
-    if (std::fwrite(&value, 1, 1, ctx.solved) != 1) {
-        std::perror("fwrite solved value");
-        return;
-    }
-
-    printf("sucessful write!! \n");
-}
-
-inline std::uint8_t read_solved_value(std::uint64_t shape, std::uint32_t page_id, 
-                                     std::uint32_t bit_in_page, Context& ctx) {
-    if (!ctx.solved) {
-        std::fprintf(stderr, "Error: solved file not open on read\n");
-        return 0;
-    }
-    
-    const std::uint64_t page_offset = offset_of(ctx, shape, page_id);
-
-    const std::uint64_t solved_offset = (page_offset << 3) + bit_in_page;
-
-    printf("Reading file: %s \n", ctx.solved_path.c_str());
-    printf("Reading file size: %lu \n", ctx.file_size);
-    printf("offset: %llu \n", solved_offset);
-    
-    if (std::fseek(ctx.solved, (long)solved_offset, SEEK_SET) != 0) {
-        std::perror("fseek solved file");
-        return 0;
-    }
-
-    std::uint8_t value;
-    if (std::fread(&value, 1, 1, ctx.solved) != 1) {
-        std::perror("fread solved value");
-        return 0;
-    }
-
-    printf("fread succesfull! The value is: %d \n", value);
-
-    return value;
-}
-
 inline MPI_Datatype make_TierMsg_type() {
     MPI_Datatype T;
-    const int N = 4;
-    int          bl[N]  = {1,1,1,1};
+    const int N = 5;
+    int          bl[N]  = {1,1,1,1,1};
     MPI_Aint     dis[N] = {};
-    MPI_Datatype ty[N]  = {MPI_UINT8_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T};
+    MPI_Datatype ty[N]  = {MPI_UINT8_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT64_T};
 
     TierMsg probe{};
-    MPI_Aint base=0, a0=0, a1=0, a2=0, a3=0;
+    MPI_Aint base=0, a0=0, a1=0, a2=0, a3=0, a4=0;
     MPI_Get_address(&probe,        &base);
     MPI_Get_address(&probe.tier,  &a0);
     MPI_Get_address(&probe.shape,  &a1);
     MPI_Get_address(&probe.page,   &a2);
     MPI_Get_address(&probe.bit,    &a3);
-    dis[0] = a0 - base; dis[1] = a1 - base; dis[2] = a2 - base, dis[3] = a3 - base;
+    MPI_Get_address(&probe.hash,   &a4);
+    dis[0] = a0 - base; dis[1] = a1 - base; dis[2] = a2 - base, dis[3] = a3 - base; dis[4] = a4 - base
 
     MPI_Type_create_struct(N, bl, dis, ty, &T);
     MPI_Type_commit(&T);
@@ -385,121 +361,151 @@ inline TierMsg make_TierMsg_from_pos(const game::Encoding& position) noexcept {
     const auto sh = game::shape(c);
     const auto h  = game::hash(c);
     const auto tier = game::tier_of(sh);
+    m.tier = tier;
     m.shape = sh;
     m.page  = static_cast<std::uint32_t>(h >> pageops::PAGE_BITS);
     m.bit   = static_cast<std::uint32_t>(h & ((1u << pageops::PAGE_BITS) - 1u));
-    m.tier = tier;
+    m.hash = h;
     return m;
 }
 
-inline void solve_pos(Context (&ctx_by_tier)[game::MAX_TIER + 1],
-                    std::uint64_t shape,
-                    std::uint32_t page_id,
-                    std::uint32_t bit_in_page,
-                    std::uint8_t tier, 
-                    MPI_Comm comm) 
-{
-    Context& ctx = ctx_by_tier[tier];
-    int rank, size;
-    MPI_Comm_rank(comm, &rank);
-    MPI_Comm_size(comm, &size);
+inline std::uint8_t infer_skipped_pos() {
 
-    // Safety checks
-    if (bit_in_page >= (1u << PAGE_BITS)) {
-        std::fprintf(stderr, "Error: bit_in_page %u exceeds PAGE_BITS %zu\n", bit_in_page, PAGE_BITS);
+}
+
+inline std::uint8_t get_child_cache_value(Context& ctx, TierMsg& child) {
+    auto it = ctx.child_cache.find(child.hash);
+    if (it!=ctx.cache.end()) {
+        if (it->second == 0) {
+            return infer_skipped_pos()
+        }
+        return it->second;
+    }
+
+    bool rec_exists = false;
+    std::fseek(ctx.child_cache, 0, SEEK_SET);
+    ChildCacheRec rec;
+    while (std::fread(&rec, sizeof(rec), 1, ctx.child_cache) == 1) {
+        if (rec.hash == hash) {
+            rec_exists = true; break;
+        }
+    }
+    if (rec_exists) {
+        auto [it, inserted] = ctx.child_cache.try_emplace(hash);
+        it->second = rec.value;
+    } else {
+        rec = {hash, }
+    }
+
+    // implement cache eviction policy
+
+    return rec.value
+}
+
+inline void write_solved_value(Context& ctx, std::uint64_t shape, std::uint32_t page_id, 
+                               std::uint32_t bit_in_page, std::uint8_t value) {
+    if (!ctx.solved) {
+        std::fprintf(stderr, "Error: solved file not open on write\n");
         return;
     }
     
-    std::uint64_t restored_hash = (page_id << PAGE_BITS) | bit_in_page;
-    game::Encoding pos = game::unhash(static_cast<bitops6::Bitboard>(shape), restored_hash);
-    printf("Game position (player): %llu \n", pos.player);
-    if (std::uint8_t prim = game::primitive(pos)) {
-        printf("stats before solving -- shape: %llu, page: %u, bit: %u\n", shape, page_id, bit_in_page);
-        write_solved_value(ctx, shape, page_id, bit_in_page, prim);
+    const std::uint64_t page_offset = offset_of(ctx, shape, page_id);
+    const std::uint64_t solved_offset = (page_offset << 3) + bit_in_page;
+
+    if (std::fseek(ctx.solved, (long)solved_offset, SEEK_SET) != 0) {
+        std::perror("fseek solved file");
         return;
     }
 
+    if (std::fwrite(&value, 1, 1, ctx.solved) != 1) {
+        std::perror("fwrite solved value");
+        return;
+    }
+
+}
+
+inline std::uint8_t read_solved_value(std::uint64_t shape, std::uint32_t page_id, 
+                                     std::uint32_t bit_in_page, Context& ctx) {
+    if (!ctx.solved) {
+        std::fprintf(stderr, "Error: solved file not open on read\n");
+        return 0;
+    }
+    
+    const std::uint64_t page_offset = offset_of(ctx, shape, page_id);
+    const std::uint64_t solved_offset = (page_offset << 3) + bit_in_page;
+    
+    if (std::fseek(ctx.solved, (long)solved_offset, SEEK_SET) != 0) {
+        std::perror("fseek solved file");
+        return 0;
+    }
+
+    std::uint8_t value;
+    if (std::fread(&value, 1, 1, ctx.solved) != 1) {
+        std::perror("fread solved value");
+        return 0;
+    }
+
+    return value;
+}
+
+inline void solve_pos(Context& ctx,
+                    std::uint64_t shape,
+                    std::uint32_t page_id,
+                    std::uint32_t bit_in_page,
+                    std::uint8_t tier) 
+{   
+    std::uint64_t restored_hash = (page_id << PAGE_BITS) | bit_in_page;
+    game::Encoding pos = game::unhash(static_cast<bitops6::Bitboard>(shape), restored_hash);
+    if (std::uint8_t prim = game::primitive(pos)) {
+        write_solved_value(ctx, shape, page_id, bit_in_page, prim); return;
+    }
+
     std::uint64_t moves = game::legal_moves(pos);
-    int num_children = (moves ? std::popcount(moves) : 1);
+    int num_children = moves ? std::popcount(moves): 1;
     std::vector<std::uint8_t> children(num_children);
-    std::vector<MPI_Request> child_send_requests(num_children);
-    std::vector<MPI_Request> child_req_requests(num_children);
-    std::vector<TierMsg> outgoing_msgs(num_children);
-    std::vector<int> skipped_msgs(num_children);
-    int head = 0;
     MPI_Datatype TIER_T = make_TierMsg_type(); 
 
     if (moves) {
-        printf("Number of moves is %d", std::popcount(moves));
         int dest;
         while (moves) {
             std::uint64_t mv = moves & -moves;
             moves ^= mv;
             const game::Encoding nxt = game::flip(game::do_move(pos, mv));
             TierMsg child = make_TierMsg_from_pos(nxt);
-            printf("send side -- shape: %llu, page: %u, bit: %u, tier: %d \n", child.shape, child.page, child.bit, child.tier);
             dest = owner_of_shape(child.shape, size);
 
-            outgoing_msgs[head] = child;
-            if (dest == rank) {
-                if (child.tier == tier) {
-                    skipped_msgs.push_back(head);
-                } else {
-                    children[head] = read_solved_value(child.shape, child.page, child.bit, ctx_by_tier[child.tier]);
-                }
-                child_send_requests[head] = child_req_requests[head] = MPI_REQUEST_NULL;
-                head++;
-                continue;
-            }
+            get_child_cache_value(ctx, child); // must take into account skips
+            children.push_back(); 
 
-            MPI_Send(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm);
-            printf("reached past the send request blocking \n"); 
-            MPI_Irecv(children.data() + head, 1, MPI_UINT8_T, dest, TAG_MAIN_TO_MODULE, comm, child_req_requests.data() + head);
-            head++;
+            /* Pseudocode: 
+            next tier <- global file + offset(child tier) + offset(dest)
+            if child skips: infer value 
+            else: read value
+            populate current tier
+            flush cache
+            save next tier
+            */
         }
-    } else {
-        const game::Encoding flipped = game::flip(pos);
-        TierMsg child = make_TierMsg_from_pos(flipped);
-        int dest = owner_of_shape(child.shape, size);
-
-        outgoing_msgs[head] = child;
-        if (dest == rank) {
-            if (child.tier == tier) {
-                skipped_msgs.push_back(head);
-            } else {
-                children[head] = read_solved_value(child.shape, child.page, child.bit, ctx_by_tier[child.tier]);
-            }
-            child_send_requests[head] = child_req_requests[head] = MPI_REQUEST_NULL;
-        } else {
-            MPI_Send(outgoing_msgs.data() + head, 1, TIER_T, dest, TAG_MODULE_TO_MAIN, comm);
-            MPI_Irecv(children.data() + head, 1, MPI_UINT8_T, dest, TAG_MAIN_TO_MODULE, comm, child_req_requests.data() + head);
-        }
-    }
-    MPI_Waitall(child_req_requests.size(), child_req_requests.data(), MPI_STATUSES_IGNORE);
-    printf("reached past waitall \n");
-    for (int idx : skipped_msgs) {
-        TierMsg neighbor = outgoing_msgs[idx];
-        children[idx] = read_solved_value(neighbor.shape, neighbor.page, neighbor.bit, ctx_by_tier[tier]);
-    }
+    } 
 
     // Value and Remoteness logic
     std::uint8_t v_and_r;
-    if (bitops6::all_losing(children)) {
-        v_and_r = game::WIN | (bitops6::find_closest_prim(children) + 1);
-    } else if (bitops6::tie_exists(children)) {
-        v_and_r = game::DRAW | (bitops6::find_farthest_prim(children) + 1);
+    std::vector<uint8_t> res = bitops6::points_of_interest(children);
+    if (res[1] == 0 && res[2] == 0xFF) {
+        v_and_r = game::LOSE | (res[0] + 1);
+    } else if (res[2] != 0xFF) {
+        v_and_r = game::WIN | (res[2] + 1);
     } else {
-        v_and_r = game::LOSE | (bitops6::find_farthest_prim(children) + 1);
-    }
+        v_and_r = game::DRAW | (res[1] + 1);
+    } 
     
     write_solved_value(ctx, shape, page_id, bit_in_page, v_and_r);
-    std::printf("Restored hash: %llu\n", (unsigned long long)restored_hash);
-    std::printf("Value and remoteness: %d\n", v_and_r);
+    // std::printf("Restored hash: %llu\n", (unsigned long long)restored_hash);
+    std::printf("The value and remoteness: %lu for tier %d \n", (long)v_and_r, tier);
     return;
 }
 
-inline void solve_page(Context (&ctx_by_tier)[game::MAX_TIER + 1], std::uint8_t tier, MPI_Comm comm) {
-    Context& ctx = ctx_by_tier[tier];
+inline void solve_tier(Context& ctx, std::uint8_t tier) {
     auto it_outer = ctx.meta_map.find(tier);
 
     if (it_outer != ctx.meta_map.end()) {
@@ -519,7 +525,7 @@ inline void solve_page(Context (&ctx_by_tier)[game::MAX_TIER + 1], std::uint8_t 
                             bi++; 
                         }
                         std::uint32_t bip = (wi << 6) + bi; 
-                        solve_pos(ctx_by_tier, inner_key.shape, inner_key.page, bip, tier, comm);
+                        solve_pos(ctx, inner_key.shape, inner_key.page, bip, tier);
                         word_buf >>= 1;
                         bi++;
                     }
@@ -527,12 +533,15 @@ inline void solve_page(Context (&ctx_by_tier)[game::MAX_TIER + 1], std::uint8_t 
             }
         }
     }
+
+
 }
 
 } // namespace pageops
 
 /*
 
+Test 1:
 ┌───┬───┬───┬───┬───┬───┐
 │ . │ P │ P │ P │ P │ P │
 ├───┼───┼───┼───┼───┼───┤
@@ -559,6 +568,21 @@ inline void solve_page(Context (&ctx_by_tier)[game::MAX_TIER + 1], std::uint8_t 
 │ P │ O │ O │ O │ P │ P │
 ├───┼───┼───┼───┼───┼───┤
 │ P │ P │ P │ P │ P │ P │
+└───┴───┴───┴───┴───┴───┘
+
+Test 2: 
+┌───┬───┬───┬───┬───┬───┐
+│ . │ P │ P │ P │ P │ P │
+├───┼───┼───┼───┼───┼───┤
+│ P │ O │ O │ O │ O │ P │
+├───┼───┼───┼───┼───┼───┤
+│ P │ O │ . │ O │ O │ P │
+├───┼───┼───┼───┼───┼───┤
+│ P │ O │ O │ O │ . │ P │
+├───┼───┼───┼───┼───┼───┤
+│ P │ O │ . │ O │ O │ P │
+├───┼───┼───┼───┼───┼───┤
+│ P │ P │ P │ P │ P │ . │
 └───┴───┴───┴───┴───┴───┘
 
 */

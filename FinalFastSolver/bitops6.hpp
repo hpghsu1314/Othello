@@ -102,34 +102,42 @@ namespace bitops6 {
         return res;
     }
 
-    inline bool all_losing(const std::vector<uint8_t>& v) {
-        auto is_losing = [](uint8_t n) {
-            std::uint8_t msb2 = n >> 6;
-            return msb2 == (0b01000000 >> 6); // LOSE >> 6
-        };
-        return std::all_of(v.begin(), v.end(), is_losing);
-    }
+    inline std::vector<uint8_t> points_of_interest(const std::vector<uint8_t>& v) {
+        std::vector<uint8_t> results(3);
+        auto is_win = [](uint8_t n) {return (n >> 6) == 0b11;};
+        auto is_tie = [](uint8_t n) {return (n >> 6) == 0b10;};
+        auto is_loss = [](uint8_t n) {return (n >> 6) == 0b01;};
 
-    inline bool tie_exists(const std::vector<uint8_t>& v) {
-        auto has_tie = [](uint8_t n) {
-            std::uint8_t msb2 = n >> 6;
-            return msb2 == (0b10000000 >> 6); // DRAW >> 6
-        };
-        return std::any_of(v.begin(), v.end(), has_tie);
-    }
+        uint8_t best_win = 0x00, best_tie = 0x00, best_loss = 0xFF; 
+        bool found_win = false, found_tie = false, found_loss = false;
 
-    inline std::uint8_t find_closest_prim(const std::vector<uint8_t>& v) {
-        std::uint8_t result = std::ranges::min(v | std::views::transform([](std::uint8_t x) {
-            return x & ((1<<5) - 1); 
-        }));
-        return result;
-    }
+        for (uint8_t x : v) {
+            if (is_win(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1); 
+                if (!found_win || remoteness > best_win) {
+                    best_win = remoteness;
+                    found_win = true;
+                }
+            }
+            if (is_tie(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
+                if (!found_tie || remoteness > best_tie) {
+                    best_tie = remoteness;
+                    found_tie = true;
+                }
+            }
+            if (is_loss(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
+                if (!found_loss || remoteness < best_loss) {
+                    best_loss = remoteness;
+                    found_loss = true;
+                }
+            }
+        }
 
-    inline std::uint8_t find_farthest_prim(const std::vector<uint8_t>& v) {
-        std::uint8_t result = std::ranges::max(v | std::views::transform([](std::uint8_t x) {
-            return x & ((1<<5) - 1); 
-        }));
-        return result;
+        results[0] = found_win ? best_win : 0;
+        results[1] = found_tie ? best_tie : 0;
+        results[2] = found_loss ? best_loss : 0xFF;
+        return results;
     }
-
 }
