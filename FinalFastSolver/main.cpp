@@ -308,16 +308,6 @@ int main(int argc, char** argv) {
             const std::uint8_t tier = game::tier_of(msg.shape);
             pageops::Context& ctx   = get_ctx(tier);
 
-            if (!pageops::set_bit(ctx, msg.shape, msg.page, msg.bit))
-                continue; // already seen
-
-            ++how_many_pos;
-            if ((how_many_pos % 100000) == 0) {
-                // printf("Rank %d has found %llu\n", R, how_many_pos);
-                fflush(stdout);
-                TimerAggregator::instance().report();
-            }
-
             const std::uint64_t h =
                 ((std::uint64_t)msg.page << pageops::PAGE_BITS) |
                  (std::uint64_t)msg.bit;
@@ -328,6 +318,21 @@ int main(int argc, char** argv) {
             std::uint64_t moves = time_block("legal_moves", [&] {
                 return game::legal_moves(pos);
             });
+
+            if (moves && !pageops::set_bit(ctx, msg.shape, msg.page, msg.bit)) {
+                continue;
+            } else if (game::primitive(pos)) {
+                pageops::set_bit(ctx, msg.shape, msg.page, msg.bit);
+                continue;
+            }
+
+            ++how_many_pos;
+            if ((how_many_pos % 100000) == 0) {
+                // printf("Rank %d has found %llu\n", R, how_many_pos);
+                fflush(stdout);
+                TimerAggregator::instance().report();
+            }
+
             if (moves) {
                 while (moves) {
                     std::uint64_t mv = moves & -moves;
