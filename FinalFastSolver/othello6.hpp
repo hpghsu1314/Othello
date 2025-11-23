@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include "bitops6.hpp"
+#include <vector>
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)
   #include <immintrin.h>  // for _pext_u64 / _pdep_u64 (BMI2)
@@ -288,6 +289,46 @@ namespace game {
         return DRAW;
     }
 
+    inline std::vector<uint8_t> points_of_interest(const std::vector<uint8_t>& v) noexcept {
+        std::vector<uint8_t> results(3);
+        auto is_win = [](uint8_t n) {return (n >> 6) == 0b11;};
+        auto is_tie = [](uint8_t n) {return (n >> 6) == 0b10;};
+        auto is_loss = [](uint8_t n) {return (n >> 6) == 0b01;};
+
+        uint8_t best_win = 0x00, best_tie = 0x00, best_loss = 0xFF; 
+        bool found_win = false, found_tie = false, found_loss = false;
+
+        for (uint8_t x : v) {
+            if (is_win(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1); 
+                if (!found_win || remoteness > best_win) {
+                    best_win = remoteness;
+                    found_win = true;
+                }
+            }
+            if (is_tie(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
+                if (!found_tie || remoteness > best_tie) {
+                    best_tie = remoteness;
+                    found_tie = true;
+                }
+            }
+            if (is_loss(x)) {
+                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
+                if (!found_loss || remoteness < best_loss) {
+                    best_loss = remoteness;
+                    found_loss = true;
+                }
+            }
+        }
+
+        // Sentinel value: 0xFF
+        results[0] = found_win ? best_win : 0xFF; 
+        results[1] = found_tie ? best_tie : 0xFF;
+        results[2] = found_loss ? best_loss : 0xFF;
+        return results;
+    }
+
     OTH_FORCE_INLINE std::uint8_t tier_of(Bitboard shapeMask) noexcept {
     #if __cpp_lib_bitops >= 201907L
         return static_cast<std::uint8_t>(std::popcount(shapeMask));
@@ -337,6 +378,9 @@ namespace game {
         }
         Encoding starting_position() const noexcept {
             return game::starting_position();
+        }
+        std::vector<std::uint8_t> points_of_interest(std::vector<std::uint8_t> children) const noexcept {
+            return game::points_of_interest(children);
         }
     };
 }

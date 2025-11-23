@@ -10,5 +10,6 @@ struct HitMsg {
 };
 struct TierMsg : HitMsg {
     std::uint8_t tier;
+    std::uint64_t hash;
 };
 #pragma pack(pop)

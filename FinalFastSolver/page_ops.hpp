@@ -2,6 +2,7 @@
 #include <mpi.h>
 #include <cstdint>
 #include <cstdio>
+#include <list>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -10,7 +11,7 @@
 #include <vector>
 #include <filesystem>
 #include <functional>
-#include "othello6.hpp"
+#include "othello6.hpp" // must be changed for 4x4
 #include "bitops6.hpp"
 #include "message.hpp"
 #include "utilities.hpp"
@@ -23,14 +24,13 @@ static constexpr std::size_t PAGE_BITS   = 12;
 static constexpr std::size_t PAGE_BYTES  = (1u << (PAGE_BITS - 3));              // 2^(PAGE_BITS)/8
 static constexpr std::size_t PAGE_QWORDS = PAGE_BYTES / sizeof(std::uint64_t);
 static constexpr std::uint8_t REMOTENESS_BITS = 5;
-static constexpr int TAG_MODULE_TO_MAIN = 2;
-static constexpr int TAG_MAIN_TO_MODULE = 3;
 
 struct Key {
     std::uint64_t shape;
     std::uint32_t page;
     inline bool operator==(const Key& o) const noexcept { return shape==o.shape && page==o.page; }
 };
+
 struct KeyHash {
     inline std::size_t operator()(const Key& k) const noexcept {
         std::uint64_t x = k.shape ^ (std::uint64_t(k.page) * 0x9e3779b97f4a7c15ULL);
@@ -43,10 +43,8 @@ struct KeyHash {
 
 #pragma pack(push,1)
 struct PageIdxRec { std::uint64_t shape; std::uint32_t page; std::uint64_t off; };
-struct ChildCacheRec { std::uint64_t hash; std::uint8_t value; };
 #pragma pack(pop)
 static_assert(sizeof(PageIdxRec)==20, "PageIdxRec must be 20 bytes");
-static_assert(sizeof(ChildCacheRec)==9, "ChildCacheRec must be 9 bytes");
 
 struct PageBuf {
     alignas(64) std::array<std::uint64_t, PAGE_QWORDS> w{};
@@ -58,7 +56,48 @@ struct PageBuf {
 
 using MetaMap  = std::unordered_map<std::uint64_t, std::unordered_map<Key, std::uint64_t, KeyHash>>; 
 using CacheMap = std::unordered_map<Key, PageBuf,   KeyHash>;
-using SolvedCacheMap = std::unordered_map<std::uint64_t, std::uint8_t>;
+
+class LRUCache {
+public:
+    struct Entry {
+        Key key;
+        std::array<uint8_t, (PAGE_BYTES << 3)> buf;
+    };
+
+    unsigned int capacity;
+    std::list<Entry> order;
+    std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> lookup;
+
+    LRUCache(unsigned int capacity)
+        : capacity(capacity) {}
+
+    std::array<uint8_t, (PAGE_BYTES << 3)>* find(Key key) {
+        auto it = lookup.find(key);
+        if (it == lookup.end()) return nullptr;
+
+        order.splice(order.begin(), order, it->second);
+        return &it->second->buf;
+    }
+
+    void put(Key key, const std::array<uint8_t, (PAGE_BYTES << 3)>& buf) {
+        auto it = lookup.find(key);
+        if (it != lookup.end()) {
+            it->second->buf = buf;
+            order.splice(order.begin(), order, it->second);
+            return;
+        }
+
+        if (order.size() == capacity) {
+            auto lru = std::prev(order.end());
+            lookup.erase(lru->key);
+            order.erase(lru);
+        }
+
+        order.push_front({key, buf});
+        lookup[key] = order.begin();
+    }
+};
+
 
 template <typename Key>
 uint64_t* nested_find(MetaMap& map, std::uint64_t outer, const Key& inner_key)
@@ -78,24 +117,25 @@ struct Context {
     std::FILE* data = nullptr;  // pages.dat
     std::FILE* idx  = nullptr;  // pages.idx
     std::FILE* solved = nullptr; // pages.solved, per tier
-    std::FILE* child_cache = nullptr; // page.child_cache 
     std::size_t file_size = 0;  // current end of pages.dat (bytes)
 
     // Paths
     std::string data_path;
     std::string idx_path;
     std::string solved_path;
-    std::string child_cache_path;
 
     // In-RAM maps
     MetaMap  meta_map;          // tier -> (shape, page) -> offset
     CacheMap cache;             // (shape,page) -> page buffer (in-place, no moves/copies)
-    SolvedCacheMap tier_cache;             // offset -> value/remoteness
 
     // Cache size knob (pages)
     std::size_t cache_cap_pages = 4096u * 16u;
 
+    // Read-only LRU cache for solving
+    LRUCache rec_cache;             // (shape, page) -> offset (no flushing)
+
     bool inited{false};
+    Context() : rec_cache(4096u * 16u) {}
 };
 
 // One shared zero page for append
@@ -106,18 +146,16 @@ inline const std::uint8_t ZERO_PAGE[PAGE_BYTES] = {0};
 inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::string& root_dir) {
     if (ctx.inited) return;
 
-    char dir[512], dpath[512], ipath[512], spath[512], cpath[512];
+    char dir[512], dpath[512], ipath[512], spath[512];
     std::snprintf(dir,   sizeof(dir),   "%s/owner_%02d/tier_%02u", root_dir.c_str(), owner_num, tier);
     std::snprintf(dpath, sizeof(dpath), "%s/pages.dat", dir);
     std::snprintf(ipath, sizeof(ipath), "%s/pages.idx", dir);
     std::snprintf(spath, sizeof(spath), "%s/pages.solved", dir);
-    std::snprintf(cpath, sizeof(cpath), "%s/pages.child_cache", dir);
     fs::create_directories(dir);
 
     ctx.data_path = dpath;
     ctx.idx_path  = ipath;
     ctx.solved_path = spath;
-    ctx.child_cache_path = cpath;
 
     ctx.data = std::fopen(ctx.data_path.c_str(), "rb+");
     if (!ctx.data) ctx.data = std::fopen(ctx.data_path.c_str(), "wb+");
@@ -127,10 +165,6 @@ inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::st
     ctx.idx = std::fopen(ctx.idx_path.c_str(), "ab+");
     if (!ctx.idx) { std::perror("fopen pages.idx"); std::exit(1); }
     std::setvbuf(ctx.idx, nullptr, _IOFBF, 1<<20);
-
-    ctx.child_cache = std::fopen(ctx.child_cache_path.c_str(), "ab+");
-    if (!ctx.child_cache) { std::perror("fopen pages.child_cache"); std::exit(1); }
-    std::setvbuf(ctx.child_cache, nullptr, _IOFBF, 1<<20);
 
     ctx.solved = std::fopen(ctx.solved_path.c_str(), "rb+");
     if (!ctx.solved) ctx.solved = std::fopen(ctx.solved_path.c_str(), "wb+");
@@ -143,39 +177,51 @@ inline void pages_init(Context& ctx, int owner_num, unsigned tier, const std::st
     ctx.inited = true;
 }
 
-// ---------- global_db initialization ----------
-// Initialize the global_db file in the data directory (not owned by any particular rank)
-inline std::FILE* global_db_init(const std::string& root_dir) {
-    // Ensure data directory exists
+inline MPI_File init_db_write_only(const std::string& root_dir, const std::string& suffix, int tier, MPI_Comm comm, int mpi_mode = MPI_MODE_WRONLY) {
+    // Create data directory
+    char gpath[512];
+    std::snprintf(gpath, sizeof(gpath), "%s/tier_%02u_db/tier.%s", root_dir.c_str(), tier, suffix.c_str());
+
+    // Ensure path exists on all ranks
+    fs::path dir = fs::path(gpath).parent_path();
+    fs::create_directories(dir);
+    
+    // Use MPI File utilities for file operations 
+    MPI_File fh;
+    int rc = MPI_File_open(comm, gpath, mpi_mode, MPI_INFO_NULL, &fh);
+    if (rc != MPI_SUCCESS) {
+        char errstr[MPI_MAX_ERROR_STRING];
+        int resultlen;
+        MPI_Error_string(rc, errstr, &resultlen);
+        fprintf(stderr, "Rank: MPI_File_open failed: %s\n", errstr);
+        MPI_Abort(comm, rc);
+    }
+    return fh;
+}
+
+inline std::FILE* init_db_read_only(const std::string& root_dir, const std::string& suffix, int tier) {
+    // Ensure data directory exists (shouldn't be needed)
     fs::create_directories(root_dir);
     
     char gpath[512];
-    std::snprintf(gpath, sizeof(gpath), "%s/global_db", root_dir.c_str());
+    std::snprintf(gpath, sizeof(gpath), "%s/tier_%02u_db/tier.%s", root_dir.c_str(), tier, suffix.c_str());
     
-    // Open in append mode (ab+) - allows reading and appending
-    std::FILE* global_db = std::fopen(gpath, "ab+");
-    if (!global_db) {
-        std::perror("fopen global_db");
-        std::exit(1);
+    // File already exists from below tiers
+    std::FILE* fp = std::fopen(gpath, "rb");
+    if (!fp) {
+        std::perror("fopen");
     }
-    
-    std::setvbuf(global_db, nullptr, _IOFBF, 1<<20); // 1 MiB
-    return global_db;
+    return fp;
 }
 
-inline void global_db_close(std::FILE*& global_db) {
-    if (global_db) {
-        std::fflush(global_db);
-        std::fclose(global_db);
-        global_db = nullptr;
-    }
+inline void db_close(MPI_File& fh) {
+    MPI_File_close(&fh);
 }
 
 inline void pages_flush(Context& ctx) {
     if (ctx.data) std::fflush(ctx.data);
     if (ctx.idx)  std::fflush(ctx.idx);
     if (ctx.solved) std::fflush(ctx.solved);
-    if (ctx.child_cache) std::fflush(ctx.child_cache);
 }
 
 inline void pages_close(Context& ctx) {
@@ -183,7 +229,6 @@ inline void pages_close(Context& ctx) {
     if (ctx.data) { std::fclose(ctx.data); ctx.data=nullptr; }
     if (ctx.idx)  { std::fclose(ctx.idx);  ctx.idx=nullptr;  }
     if (ctx.solved) { std::fclose(ctx.solved); ctx.solved=nullptr; }
-    if (ctx.child_cache) std::fflush(ctx.child_cache);
     ctx.inited = false;
 }
 
@@ -215,6 +260,7 @@ inline void flush_all(Context& ctx) {
     }
     if (ctx.data) std::fflush(ctx.data);
     if (ctx.idx)  std::fflush(ctx.idx);
+    if (ctx.solved) std::fflush(ctx.solved);
 }
 
 inline std::uint64_t offset_of(Context& ctx, std::uint64_t shape, std::uint32_t page_id) {
@@ -251,8 +297,8 @@ inline std::uint64_t ensure_page_exists_fast(Context& ctx,
     }
 
     std::fseek(ctx.solved, (long)(off << 3), SEEK_SET);
-    std::array<std::uint8_t, PAGE_BYTES> zeros{};
-    if (std::fwrite(zeros.data(), 1, (PAGE_BYTES << 3), ctx.solved) != (PAGE_BYTES << 3)) {
+    std::array<std::uint8_t, PAGE_BYTES> extended_zero_page{};
+    if (std::fwrite(extended_zero_page.data(), 1, (PAGE_BYTES << 3), ctx.solved) != (PAGE_BYTES << 3)) {
         std::perror("fwrite pages.solved"); std::exit(1);
     }
 
@@ -333,28 +379,6 @@ inline bool set_bit(Context& ctx,
     return was_new;
 }
 
-inline MPI_Datatype make_TierMsg_type() {
-    MPI_Datatype T;
-    const int N = 5;
-    int          bl[N]  = {1,1,1,1,1};
-    MPI_Aint     dis[N] = {};
-    MPI_Datatype ty[N]  = {MPI_UINT8_T, MPI_UINT64_T, MPI_UINT32_T, MPI_UINT32_T, MPI_UINT64_T};
-
-    TierMsg probe{};
-    MPI_Aint base=0, a0=0, a1=0, a2=0, a3=0, a4=0;
-    MPI_Get_address(&probe,        &base);
-    MPI_Get_address(&probe.tier,  &a0);
-    MPI_Get_address(&probe.shape,  &a1);
-    MPI_Get_address(&probe.page,   &a2);
-    MPI_Get_address(&probe.bit,    &a3);
-    MPI_Get_address(&probe.hash,   &a4);
-    dis[0] = a0 - base; dis[1] = a1 - base; dis[2] = a2 - base, dis[3] = a3 - base; dis[4] = a4 - base
-
-    MPI_Type_create_struct(N, bl, dis, ty, &T);
-    MPI_Type_commit(&T);
-    return T;
-}
-
 inline TierMsg make_TierMsg_from_pos(const game::Encoding& position) noexcept {
     TierMsg m{};
     const auto c  = game::canonical(position);
@@ -362,44 +386,51 @@ inline TierMsg make_TierMsg_from_pos(const game::Encoding& position) noexcept {
     const auto h  = game::hash(c);
     const auto tier = game::tier_of(sh);
     m.tier = tier;
-    m.shape = sh;
+    m.shape = sh;   
     m.page  = static_cast<std::uint32_t>(h >> pageops::PAGE_BITS);
     m.bit   = static_cast<std::uint32_t>(h & ((1u << pageops::PAGE_BITS) - 1u));
     m.hash = h;
     return m;
 }
 
-inline std::uint8_t infer_skipped_pos() {
+inline uint8_t load_into_cache(Context& ctx, 
+                            TierMsg& child, 
+                            int num_processes,
+                            std::FILE* data_fp, 
+                            std::FILE* rec_fp, 
+                            std::vector<std::vector<uint64_t>>& data_lookup,
+                            std::vector<std::vector<uint64_t>>& rec_lookup) 
+{
+    const Key k{child.shape, child.page};
+    std::array<uint8_t, (PAGE_BYTES << 3)>* buffer = ctx.rec_cache.find(k);
+    if (buffer) return (*buffer)[child.bit];
 
+    // Find page respective offset
+    int dest = owner_of_shape(child.shape, num_processes);
+    std::fseek(rec_fp, rec_lookup[child.tier][dest], SEEK_SET);
+    PageIdxRec rec;
+    while (std::fread(&rec, sizeof(rec), 1, rec_fp) == 1) {
+        if (rec.shape == child.shape && rec.page == child.page) break;
+    }
+
+    // load page into cache (lookup + page offset)
+    std::array<uint8_t, (PAGE_BYTES << 3)> newBuf;
+
+    std::fseek(data_fp, data_lookup[child.tier][dest] + (rec.off << 3), SEEK_SET);
+    if (std::fread(newBuf.data(), 1, (PAGE_BYTES << 3), data_fp) != (PAGE_BYTES << 3)) {
+        std::perror("fread child value");
+        return 0;
+    }
+
+    ctx.rec_cache.put(k, newBuf);
+    return newBuf[child.bit];
 }
 
-inline std::uint8_t get_child_cache_value(Context& ctx, TierMsg& child) {
-    auto it = ctx.child_cache.find(child.hash);
-    if (it!=ctx.cache.end()) {
-        if (it->second == 0) {
-            return infer_skipped_pos()
-        }
-        return it->second;
-    }
-
-    bool rec_exists = false;
-    std::fseek(ctx.child_cache, 0, SEEK_SET);
-    ChildCacheRec rec;
-    while (std::fread(&rec, sizeof(rec), 1, ctx.child_cache) == 1) {
-        if (rec.hash == hash) {
-            rec_exists = true; break;
-        }
-    }
-    if (rec_exists) {
-        auto [it, inserted] = ctx.child_cache.try_emplace(hash);
-        it->second = rec.value;
-    } else {
-        rec = {hash, }
-    }
-
-    // implement cache eviction policy
-
-    return rec.value
+inline std::uint8_t get_prim(std::uint8_t val) {
+    std::uint8_t prim = val >> 6, rem = val & ((1 << 6) - 1), res = val + 1;
+    if (prim == (game::WIN >> 6)) res = game::LOSE | (rem + 1);
+    if (prim == (game::LOSE >> 6)) res = game::WIN | (rem + 1);
+    return res;
 }
 
 inline void write_solved_value(Context& ctx, std::uint64_t shape, std::uint32_t page_id, 
@@ -422,91 +453,81 @@ inline void write_solved_value(Context& ctx, std::uint64_t shape, std::uint32_t 
         return;
     }
 
-}
-
-inline std::uint8_t read_solved_value(std::uint64_t shape, std::uint32_t page_id, 
-                                     std::uint32_t bit_in_page, Context& ctx) {
-    if (!ctx.solved) {
-        std::fprintf(stderr, "Error: solved file not open on read\n");
-        return 0;
-    }
-    
-    const std::uint64_t page_offset = offset_of(ctx, shape, page_id);
-    const std::uint64_t solved_offset = (page_offset << 3) + bit_in_page;
-    
-    if (std::fseek(ctx.solved, (long)solved_offset, SEEK_SET) != 0) {
-        std::perror("fseek solved file");
-        return 0;
-    }
-
-    std::uint8_t value;
-    if (std::fread(&value, 1, 1, ctx.solved) != 1) {
-        std::perror("fread solved value");
-        return 0;
-    }
-
-    return value;
+    printf("successful write \n");
 }
 
 inline void solve_pos(Context& ctx,
-                    std::uint64_t shape,
-                    std::uint32_t page_id,
-                    std::uint32_t bit_in_page,
-                    std::uint8_t tier) 
-{   
+                      std::uint64_t shape,
+                      std::uint32_t page_id,
+                      std::uint32_t bit_in_page,
+                      std::uint8_t tier,
+                      int num_processes,
+                      std::FILE* data_fp,
+                      std::FILE* rec_fp,
+                      std::vector<std::vector<uint64_t>>& data_lookup,
+                      std::vector<std::vector<uint64_t>>& rec_lookup) 
+{
     std::uint64_t restored_hash = (page_id << PAGE_BITS) | bit_in_page;
     game::Encoding pos = game::unhash(static_cast<bitops6::Bitboard>(shape), restored_hash);
     if (std::uint8_t prim = game::primitive(pos)) {
-        write_solved_value(ctx, shape, page_id, bit_in_page, prim); return;
+        if (tier == 35) {
+            printf("player: %llu, opponent: %llu \n", pos.player, pos.opponent);
+        }
+        write_solved_value(ctx, shape, page_id, bit_in_page, prim); 
+        return;
     }
 
     std::uint64_t moves = game::legal_moves(pos);
     int num_children = moves ? std::popcount(moves): 1;
     std::vector<std::uint8_t> children(num_children);
-    MPI_Datatype TIER_T = make_TierMsg_type(); 
 
     if (moves) {
-        int dest;
         while (moves) {
             std::uint64_t mv = moves & -moves;
             moves ^= mv;
-            const game::Encoding nxt = game::flip(game::do_move(pos, mv));
+            game::Encoding nxt = game::flip(game::do_move(pos, mv));
+            if (!game::primitive(nxt) && !game::legal_moves(nxt)) {
+                nxt = game::flip(nxt);
+            }
             TierMsg child = make_TierMsg_from_pos(nxt);
-            dest = owner_of_shape(child.shape, size);
 
-            get_child_cache_value(ctx, child); // must take into account skips
-            children.push_back(); 
-
-            /* Pseudocode: 
-            next tier <- global file + offset(child tier) + offset(dest)
-            if child skips: infer value 
-            else: read value
-            populate current tier
-            flush cache
-            save next tier
-            */
+            uint8_t child_val = load_into_cache(ctx, child, num_processes, data_fp, rec_fp, data_lookup, rec_lookup);
+            children.push_back(child_val); 
         }
-    } 
+    } else return;
 
     // Value and Remoteness logic
     std::uint8_t v_and_r;
-    std::vector<uint8_t> res = bitops6::points_of_interest(children);
-    if (res[1] == 0 && res[2] == 0xFF) {
-        v_and_r = game::LOSE | (res[0] + 1);
-    } else if (res[2] != 0xFF) {
-        v_and_r = game::WIN | (res[2] + 1);
-    } else {
-        v_and_r = game::DRAW | (res[1] + 1);
-    } 
+    std::vector<uint8_t> res = game::points_of_interest(children);
+    if (res[1] == 0xFF && res[2] == 0xFF) v_and_r = game::LOSE | (res[0] + 1);
+    else if (res[2] != 0xFF) v_and_r = game::WIN | (res[2] + 1);
+    else v_and_r = game::DRAW | (res[1] + 1);
     
     write_solved_value(ctx, shape, page_id, bit_in_page, v_and_r);
-    // std::printf("Restored hash: %llu\n", (unsigned long long)restored_hash);
+    std::printf("Restored hash: %llu\n", (unsigned long long)restored_hash);
     std::printf("The value and remoteness: %lu for tier %d \n", (long)v_and_r, tier);
-    return;
 }
 
-inline void solve_tier(Context& ctx, std::uint8_t tier) {
+inline void solve_tier(Context& ctx, 
+                       std::uint8_t tier, 
+                       int rank, 
+                       int num_processes,
+                       MPI_File& tier_db, 
+                       MPI_File& tier_rec, 
+                       std::vector<std::vector<uint64_t>>& data_lookup,
+                       std::vector<std::vector<uint64_t>>& rec_lookup,
+                       MPI_Comm comm) 
+{
     auto it_outer = ctx.meta_map.find(tier);
+
+    std::FILE* next_tier = nullptr;
+    std::FILE* next_rec = nullptr;
+    bool accessed = false;
+    if (tier != game::MAX_TIER) {
+        next_tier = init_db_read_only("data", "dat", tier+1);
+        next_rec = init_db_read_only("data", "idx", tier+1);
+        accessed = true;
+    }
 
     if (it_outer != ctx.meta_map.end()) {
         auto& inner_map = it_outer->second; 
@@ -525,7 +546,7 @@ inline void solve_tier(Context& ctx, std::uint8_t tier) {
                             bi++; 
                         }
                         std::uint32_t bip = (wi << 6) + bi; 
-                        solve_pos(ctx, inner_key.shape, inner_key.page, bip, tier);
+                        solve_pos(ctx, inner_key.shape, inner_key.page, bip, tier, num_processes, next_tier, next_rec, data_lookup, rec_lookup);
                         word_buf >>= 1;
                         bi++;
                     }
@@ -534,7 +555,40 @@ inline void solve_tier(Context& ctx, std::uint8_t tier) {
         }
     }
 
+    // page.solved -> tier_db | page.idx -> tier_rec
+    size_t data_size = 0, rec_size = 0; 
+    std::vector<uint8_t> data_buf, rec_buf;
+    if (ctx.solved) {
+        fseek(ctx.solved, 0, SEEK_END); fseek(ctx.idx, 0, SEEK_END);
+        data_size = ftell(ctx.solved); rec_size = ftell(ctx.idx);
+        data_buf.resize(data_size); rec_buf.resize(rec_size);
+        rewind(ctx.solved); rewind(ctx.idx);
 
+        if (fread(data_buf.data(), 1, data_size, ctx.solved) != data_size) perror("Failed to read solved.dat");
+        if (fread(rec_buf.data(), 1, rec_size, ctx.idx) != rec_size) perror("Failed to read idx.dat");
+    }
+
+    MPI_Offset data_size_mpi = static_cast<MPI_Offset>(data_size);
+    MPI_Offset rec_size_mpi = static_cast<MPI_Offset>(rec_size);
+
+    MPI_Offset off_data = 0, off_rec = 0;
+    MPI_Exscan(&data_size_mpi, &off_data, 1, MPI_OFFSET, MPI_SUM, comm);
+    MPI_Exscan(&rec_size_mpi, &off_rec, 1, MPI_OFFSET, MPI_SUM, comm);
+
+    if (rank == 0) {
+        off_data = 0;
+        off_rec = 0;
+    }
+
+    MPI_File_write_ordered(tier_db, data_buf.data(), data_size, MPI_BYTE, MPI_STATUS_IGNORE);
+    MPI_File_write_ordered(tier_rec, rec_buf.data(), rec_size, MPI_BYTE, MPI_STATUS_IGNORE);
+
+    data_lookup[tier][rank] = off_data;
+    rec_lookup[tier][rank] = off_rec;
+
+    if (accessed) {
+        fclose(next_tier); fclose(next_rec);
+    }
 }
 
 } // namespace pageops
@@ -556,20 +610,6 @@ Test 1:
 │ P │ P │ P │ P │ P │ P │
 └───┴───┴───┴───┴───┴───┘
 
-┌───┬───┬───┬───┬───┬───┐
-│ P │ P │ P │ P │ P │ P │
-├───┼───┼───┼───┼───┼───┤
-│ P │ P │ O │ O │ O │ P │
-├───┼───┼───┼───┼───┼───┤
-│ P │ O │ P │ O │ O │ P │
-├───┼───┼───┼───┼───┼───┤
-│ P │ O │ O │ P │ O │ P │
-├───┼───┼───┼───┼───┼───┤
-│ P │ O │ O │ O │ P │ P │
-├───┼───┼───┼───┼───┼───┤
-│ P │ P │ P │ P │ P │ P │
-└───┴───┴───┴───┴───┴───┘
-
 Test 2: 
 ┌───┬───┬───┬───┬───┬───┐
 │ . │ P │ P │ P │ P │ P │
@@ -583,6 +623,6 @@ Test 2:
 │ P │ O │ . │ O │ O │ P │
 ├───┼───┼───┼───┼───┼───┤
 │ P │ P │ P │ P │ P │ . │
-└───┴───┴───┴───┴───┴───┘
+└───┴───┴───┴───┴───┴───┘   
 
 */

@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <algorithm> 
 #include <ranges>     
-#include <vector> 
 
 namespace bitops6 {
 
@@ -100,44 +99,5 @@ namespace bitops6 {
         res |= ((b & L5) >> (5*5));
 
         return res;
-    }
-
-    inline std::vector<uint8_t> points_of_interest(const std::vector<uint8_t>& v) {
-        std::vector<uint8_t> results(3);
-        auto is_win = [](uint8_t n) {return (n >> 6) == 0b11;};
-        auto is_tie = [](uint8_t n) {return (n >> 6) == 0b10;};
-        auto is_loss = [](uint8_t n) {return (n >> 6) == 0b01;};
-
-        uint8_t best_win = 0x00, best_tie = 0x00, best_loss = 0xFF; 
-        bool found_win = false, found_tie = false, found_loss = false;
-
-        for (uint8_t x : v) {
-            if (is_win(x)) {
-                uint8_t remoteness = x & ((1 << 6) - 1); 
-                if (!found_win || remoteness > best_win) {
-                    best_win = remoteness;
-                    found_win = true;
-                }
-            }
-            if (is_tie(x)) {
-                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
-                if (!found_tie || remoteness > best_tie) {
-                    best_tie = remoteness;
-                    found_tie = true;
-                }
-            }
-            if (is_loss(x)) {
-                uint8_t remoteness = x & ((1 << 6) - 1);  // bottom 6 bits
-                if (!found_loss || remoteness < best_loss) {
-                    best_loss = remoteness;
-                    found_loss = true;
-                }
-            }
-        }
-
-        results[0] = found_win ? best_win : 0;
-        results[1] = found_tie ? best_tie : 0;
-        results[2] = found_loss ? best_loss : 0xFF;
-        return results;
     }
 }
