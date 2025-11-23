@@ -61,7 +61,7 @@ class LRUCache {
 public:
     struct Entry {
         Key key;
-        std::array<uint8_t, (PAGE_BYTES << 3)> buf;
+        std::array<std::uint8_t, (PAGE_BYTES << 3)> buf;
     };
 
     unsigned int capacity;
@@ -71,7 +71,7 @@ public:
     LRUCache(unsigned int capacity)
         : capacity(capacity) {}
 
-    std::array<uint8_t, (PAGE_BYTES << 3)>* find(Key key) {
+    std::array<std::uint8_t, (PAGE_BYTES << 3)>* find(Key key) {
         auto it = lookup.find(key);
         if (it == lookup.end()) return nullptr;
 
@@ -79,7 +79,7 @@ public:
         return &it->second->buf;
     }
 
-    void put(Key key, const std::array<uint8_t, (PAGE_BYTES << 3)>& buf) {
+    void put(Key key, const std::array<std::uint8_t, (PAGE_BYTES << 3)>& buf) {
         auto it = lookup.find(key);
         if (it != lookup.end()) {
             it->second->buf = buf;
@@ -100,7 +100,7 @@ public:
 
 
 template <typename Key>
-uint64_t* nested_find(MetaMap& map, std::uint64_t outer, const Key& inner_key)
+std::uint64_t* nested_find(MetaMap& map, std::uint64_t outer, const Key& inner_key)
 {
     auto it_outer = map.find(outer);
     if (it_outer == map.end()) return nullptr;
@@ -393,16 +393,16 @@ inline TierMsg make_TierMsg_from_pos(const game::Encoding& position) noexcept {
     return m;
 }
 
-inline uint8_t load_into_cache(Context& ctx, 
+inline std::uint8_t load_into_cache(Context& ctx, 
                             TierMsg& child, 
                             int num_processes,
                             std::FILE* data_fp, 
                             std::FILE* rec_fp, 
-                            std::vector<std::vector<uint64_t>>& data_lookup,
-                            std::vector<std::vector<uint64_t>>& rec_lookup) 
+                            std::vector<std::vector<std::uint64_t>>& data_lookup,
+                            std::vector<std::vector<std::uint64_t>>& rec_lookup) 
 {
     const Key k{child.shape, child.page};
-    std::array<uint8_t, (PAGE_BYTES << 3)>* buffer = ctx.rec_cache.find(k);
+    std::array<std::uint8_t, (PAGE_BYTES << 3)>* buffer = ctx.rec_cache.find(k);
     if (buffer) return (*buffer)[child.bit];
 
     // Find page respective offset
@@ -414,7 +414,7 @@ inline uint8_t load_into_cache(Context& ctx,
     }
 
     // load page into cache (lookup + page offset)
-    std::array<uint8_t, (PAGE_BYTES << 3)> newBuf;
+    std::array<std::uint8_t, (PAGE_BYTES << 3)> newBuf;
 
     std::fseek(data_fp, data_lookup[child.tier][dest] + (rec.off << 3), SEEK_SET);
     if (std::fread(newBuf.data(), 1, (PAGE_BYTES << 3), data_fp) != (PAGE_BYTES << 3)) {
@@ -464,8 +464,8 @@ inline void solve_pos(Context& ctx,
                       int num_processes,
                       std::FILE* data_fp,
                       std::FILE* rec_fp,
-                      std::vector<std::vector<uint64_t>>& data_lookup,
-                      std::vector<std::vector<uint64_t>>& rec_lookup) 
+                      std::vector<std::vector<std::uint64_t>>& data_lookup,
+                      std::vector<std::vector<std::uint64_t>>& rec_lookup) 
 {
     std::uint64_t restored_hash = (page_id << PAGE_BITS) | bit_in_page;
     game::Encoding pos = game::unhash(static_cast<bitops6::Bitboard>(shape), restored_hash);
@@ -491,14 +491,14 @@ inline void solve_pos(Context& ctx,
             }
             TierMsg child = make_TierMsg_from_pos(nxt);
 
-            uint8_t child_val = load_into_cache(ctx, child, num_processes, data_fp, rec_fp, data_lookup, rec_lookup);
+            std::uint8_t child_val = load_into_cache(ctx, child, num_processes, data_fp, rec_fp, data_lookup, rec_lookup);
             children.push_back(child_val); 
         }
     } else return;
 
     // Value and Remoteness logic
     std::uint8_t v_and_r;
-    std::vector<uint8_t> res = game::points_of_interest(children);
+    std::vector<std::uint8_t> res = game::points_of_interest(children);
     if (res[1] == 0xFF && res[2] == 0xFF) v_and_r = game::LOSE | (res[0] + 1);
     else if (res[2] != 0xFF) v_and_r = game::WIN | (res[2] + 1);
     else v_and_r = game::DRAW | (res[1] + 1);
@@ -514,8 +514,8 @@ inline void solve_tier(Context& ctx,
                        int num_processes,
                        MPI_File& tier_db, 
                        MPI_File& tier_rec, 
-                       std::vector<std::vector<uint64_t>>& data_lookup,
-                       std::vector<std::vector<uint64_t>>& rec_lookup,
+                       std::vector<std::vector<std::uint64_t>>& data_lookup,
+                       std::vector<std::vector<std::uint64_t>>& rec_lookup,
                        MPI_Comm comm) 
 {
     auto it_outer = ctx.meta_map.find(tier);
@@ -535,7 +535,7 @@ inline void solve_tier(Context& ctx,
             std::uint64_t word_buf;
 
             std::fseek(ctx.data, value, SEEK_SET);
-            for (uint8_t wi = 0; wi < (1 << (PAGE_BITS - 6)); wi++) {
+            for (std::uint8_t wi = 0; wi < (1 << (PAGE_BITS - 6)); wi++) {
                 if (std::fread(&word_buf, sizeof(word_buf), 1, ctx.data) != 1) break;
 
                 if (word_buf) {
@@ -557,7 +557,7 @@ inline void solve_tier(Context& ctx,
 
     // page.solved -> tier_db | page.idx -> tier_rec
     size_t data_size = 0, rec_size = 0; 
-    std::vector<uint8_t> data_buf, rec_buf;
+    std::vector<std::uint8_t> data_buf, rec_buf;
     if (ctx.solved) {
         fseek(ctx.solved, 0, SEEK_END); fseek(ctx.idx, 0, SEEK_END);
         data_size = ftell(ctx.solved); rec_size = ftell(ctx.idx);

@@ -508,14 +508,16 @@ int main(int argc, char** argv) {
 
         // Safely initialize a global file for the next tier 
         MPI_Barrier(MPI_COMM_WORLD);
+        // Flatten offset array
         for (int i = 0; i < game::MAX_TIER + 1; ++i) {
             std::memcpy(&data_flat[i*W], data_offsets[i].data(), W * sizeof(uint64_t));
             std::memcpy(&rec_flat[i*W], rec_offsets[i].data(), W * sizeof(uint64_t));
         }
-
+        
         MPI_Allreduce(MPI_IN_PLACE, data_flat.data(), (game::MAX_TIER + 1) * W, MPI_UINT64_T, MPI_BOR, MPI_COMM_WORLD);
         MPI_Allreduce(MPI_IN_PLACE, rec_flat.data(), (game::MAX_TIER + 1) * W, MPI_UINT64_T, MPI_BOR, MPI_COMM_WORLD);
         
+        // Unflatten offset array
         for (int i = 0; i < game::MAX_TIER + 1; ++i) {
             std::memcpy(data_offsets[i].data(), &data_flat[i*W], W * sizeof(uint64_t));
             std::memcpy(rec_offsets[i].data(), &rec_flat[i*W], W * sizeof(uint64_t));
