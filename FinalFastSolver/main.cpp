@@ -488,8 +488,8 @@ int main(int argc, char** argv) {
     std::vector<uint64_t> data_flat((game::MAX_TIER + 1) * W, 0);
     std::vector<uint64_t> rec_flat((game::MAX_TIER + 1) * W, 0);
     
-    // One master rank handling file creation 
-    int mode = (R == 0) ? MPI_MODE_WRONLY | MPI_MODE_CREATE : MPI_MODE_WRONLY;
+    // Safe file creation 
+    int mode = MPI_MODE_WRONLY | MPI_MODE_CREATE;
 
     MPI_File tier_db  = pageops::init_db_write_only("data", "dat", global_tier, MPI_COMM_WORLD, mode);
     MPI_File tier_rec = pageops::init_db_write_only("data", "idx", global_tier, MPI_COMM_WORLD, mode);
@@ -546,7 +546,7 @@ int main(int argc, char** argv) {
     MPI_Request_free(&rxreq);
     MPI_Type_free(&HIT_T);
 
-    std::printf("%llu\n", (unsigned long long)how_many_pos);
+    std::printf("number of positions: %llu\n", (unsigned long long)how_many_pos);
 
     MPI_Finalize();
     return 0;
