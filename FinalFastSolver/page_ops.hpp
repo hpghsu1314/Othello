@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <array>
 #include <vector>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include "othello6.hpp" // must be changed for 4x4
@@ -589,6 +590,50 @@ inline void solve_tier(Context& ctx,
     if (accessed) {
         fclose(next_tier); fclose(next_rec);
     }
+}
+
+struct Node {
+    uint8_t value;
+    uint16_t left;
+    uint16_t right;
+};
+
+inline std::deque<Node> merge_page_bytes(uint8_t* page_bytes) {
+    std::deque<Node> curr_depth;
+    int end_index = 1 << PAGE_BITS;
+    for (uint16_t i = 0; i < end_index; i++) {
+        Node byte_node = {page_bytes[i], i, i};
+        curr_depth.push_back(byte_node);
+    }
+
+    int num_merged = 0;
+    while (true) {
+        Node curr_node = curr_depth.front();
+        curr_depth.pop_front();
+
+        if (curr_node.right == end_index - 1) {
+            curr_depth.push_back(curr_node);
+            if (!num_merged) break;
+            else {num_merged = 0; continue;}
+        }
+
+        Node adj_node = curr_depth.front();
+        curr_depth.pop_front();
+
+        if ((curr_node.right - curr_node.left == adj_node.right - adj_node.left) && (curr_node.value == adj_node.value)) {
+            Node new_node = {curr_node.value, curr_node.left, adj_node.right};
+            curr_depth.push_back(new_node);
+            num_merged++;
+        } else {
+            curr_depth.push_back(curr_node);
+            curr_depth.push_back(adj_node);
+            if (adj_node.right == end_index - 1 && !num_merged) break;
+        }
+
+        if (adj_node.right == end_index - 1) num_merged = 0;
+    }
+    
+    return curr_depth;
 }
 
 } // namespace pageops
