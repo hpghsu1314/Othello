@@ -543,7 +543,13 @@ int main(int argc, char** argv) {
         tier_rec = pageops::init_db_write_only("data", "idx", global_tier, MPI_COMM_WORLD, mode);
     } while (true);
 
-    // Todo: final part pull through;
+    std::uint64_t curr_off = rec_offsets[5][R];
+    std::uint64_t next_off = get_next_offset(rec_offsets[5], curr_off);
+    pageops::compress_all_pages(5, R, data_offsets[5][R], curr_off, next_off);
+
+    curr_off = rec_offsets[4][R];
+    next_off = get_next_offset(rec_offsets[4], curr_off);
+    pageops::compress_all_pages(4, R, data_offsets[4][R], curr_off, next_off);
 
     std::printf("Rank %d: Finished solving stage\n", R);
 
