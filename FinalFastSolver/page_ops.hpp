@@ -16,6 +16,7 @@
 #include "bitops6.hpp"
 #include "message.hpp"
 #include "utilities.hpp"
+#include <zstd.h> 
 
 namespace pageops {
 
@@ -200,8 +201,24 @@ inline MPI_File init_db_write_only(const std::string& root_dir, const std::strin
     return fh;
 }
 
+inline std::FILE* rank_init_db_write_only(const std::string& root_dir, const std::string& suffix, int tier, int rank) {
+    // Create data directory
+    char gpath[512];
+    std::snprintf(gpath, sizeof(gpath), "%s/owner_%02u/tier_%02u_db/tier.%s", root_dir.c_str(), rank, tier, suffix.c_str());
+
+    // Ensure path exists on all ranks
+    fs::path dir = fs::path(gpath).parent_path();
+    fs::create_directories(dir);
+    
+    std::FILE* fp = std::fopen(gpath, "wb");
+    if (!fp) {
+        std::perror("fopen");
+    }
+    return fp;
+}
+
 inline std::FILE* init_db_read_only(const std::string& root_dir, const std::string& suffix, int tier) {
-    // Ensure data directory exists (shouldn't be needed)
+    // Ensure data directory exists
     fs::create_directories(root_dir);
     
     char gpath[512];
@@ -487,9 +504,7 @@ inline void solve_pos(Context& ctx,
             std::uint64_t mv = moves & -moves;
             moves ^= mv;
             game::Encoding nxt = game::flip(game::do_move(pos, mv));
-            if (!game::primitive(nxt) && !game::legal_moves(nxt)) {
-                nxt = game::flip(nxt);
-            }
+            if (!game::primitive(nxt) && !game::legal_moves(nxt)) nxt = game::flip(nxt);
             TierMsg child = make_TierMsg_from_pos(nxt);
 
             std::uint8_t child_val = load_into_cache(ctx, child, num_processes, data_fp, rec_fp, data_lookup, rec_lookup);
@@ -592,24 +607,58 @@ inline void solve_tier(Context& ctx,
     }
 }
 
+// Method 1:
+inline std::vector<std::uint8_t> serialize_key_map(std::uint8_t* page_bytes) {
+    std::vector<std::uint8_t> buffer;
+
+    for (std::uint16_t i = 0; i < (1 << PAGE_BITS); i++) {
+        if (page_bytes[i]) {
+            // serialize key (i) as two bytes, big-endian
+            buffer.push_back(static_cast<std::uint8_t>(i >> 8));
+            buffer.push_back(static_cast<std::uint8_t>(i & 0xFF));
+            buffer.push_back(page_bytes[i]);
+        }
+    }
+
+    return buffer;
+}
+
+// Method 2:
+inline std::array<std::uint8_t, 4096> impute_invalid_values(std::uint8_t* page_bytes) {
+    std::array<std::uint8_t, 4096> result;
+    result[0] = page_bytes[0];
+    bool is_valid = page_bytes[0] ? true : false;
+
+    for (std::uint16_t i = 1; i < (1 << PAGE_BITS); i++) {
+        if (!page_bytes[i] && is_valid) result[i] = result[i-1];
+        else {
+            if (page_bytes[i]) is_valid = true; 
+            result[i] = page_bytes[i];
+        }
+    }
+    return result;
+}
+
 struct Node {
-    uint8_t value;
-    uint16_t left;
-    uint16_t right;
+    std::uint8_t value;
+    std::uint16_t left;
+    std::uint16_t right;
 };
 
-inline std::deque<Node> merge_page_bytes(uint8_t* page_bytes) {
-    std::deque<Node> curr_depth;
+// Method 3:
+inline std::vector<Node> merge_page_bytes(std::uint8_t* page_bytes) {
+    std::vector<Node> curr_depth;
     int end_index = 1 << PAGE_BITS;
-    for (uint16_t i = 0; i < end_index; i++) {
+    for (std::uint16_t i = 0; i < end_index; i++) {
         Node byte_node = {page_bytes[i], i, i};
         curr_depth.push_back(byte_node);
     }
 
+    std::uint16_t front_index = 0;
     int num_merged = 0;
+
     while (true) {
-        Node curr_node = curr_depth.front();
-        curr_depth.pop_front();
+        Node curr_node = curr_depth[front_index++];
 
         if (curr_node.right == end_index - 1) {
             curr_depth.push_back(curr_node);
@@ -617,8 +666,7 @@ inline std::deque<Node> merge_page_bytes(uint8_t* page_bytes) {
             else {num_merged = 0; continue;}
         }
 
-        Node adj_node = curr_depth.front();
-        curr_depth.pop_front();
+        Node adj_node = curr_depth[front_index++];
 
         if ((curr_node.right - curr_node.left == adj_node.right - adj_node.left) && (curr_node.value == adj_node.value)) {
             Node new_node = {curr_node.value, curr_node.left, adj_node.right};
@@ -633,7 +681,141 @@ inline std::deque<Node> merge_page_bytes(uint8_t* page_bytes) {
         if (adj_node.right == end_index - 1) num_merged = 0;
     }
     
+    curr_depth.erase(curr_depth.begin(), curr_depth.begin() + front_index);
     return curr_depth;
+}
+
+std::vector<uint8_t> serialize_nodes(const std::vector<Node>& nodes) {
+    std::vector<uint8_t> buffer;
+    buffer.reserve(nodes.size() * 5); 
+
+    for (const auto& n : nodes) {
+        buffer.push_back(n.value);     
+        buffer.push_back(n.left >> 8);      // left high byte     
+        buffer.push_back(n.left & 0xFF);    // left low byte
+        buffer.push_back(n.right >> 8);     // right high byte
+        buffer.push_back(n.right & 0xFF);   // right low byte
+    }
+    return buffer;
+}
+
+inline void compress_all_pages(int compressable_tier, int rank, std::uint64_t file_offset, std::uint64_t start_rec_offset, std::uint64_t end_rec_offset) {
+    std::FILE* unused_tier_db = init_db_read_only("data", "dat", compressable_tier); 
+    std::FILE* unused_rec_db = init_db_read_only("data", "idx", compressable_tier);
+    std::FILE* new_tier_db = rank_init_db_write_only("data", "dat", compressable_tier, rank);
+    std::FILE* new_rec_db = rank_init_db_write_only("data", "idx", compressable_tier, rank);
+    size_t running_offset = 0;
+
+    if (!end_rec_offset) {
+        std::fseek(unused_rec_db, start_rec_offset, SEEK_SET);
+
+        PageIdxRec rec;
+        while (true) {
+            size_t nread = std::fread(&rec, sizeof(rec), 1, unused_rec_db);
+            if (nread != 1) {
+                if (feof(unused_rec_db)) break;       
+                if (ferror(unused_rec_db)) {     
+                    perror("Error reading rec_db");
+                    break;
+                }
+            }
+
+            std::fseek(unused_tier_db, file_offset + rec.off, SEEK_SET);
+
+            std::uint8_t buf[4096];
+            std::fread(buf, 1, 4096, unused_tier_db);
+
+            std::vector<std::uint8_t> m1 = serialize_key_map(buf);
+            std::array<std::uint8_t, 4096> m2 = impute_invalid_values(buf);
+            std::vector<std::uint8_t> m3 = serialize_nodes(merge_page_bytes(buf));
+
+            size_t m1_size_max = ZSTD_compressBound(m1.size());
+            size_t m2_size_max = ZSTD_compressBound(m2.size());
+            size_t m3_size_max = ZSTD_compressBound(m3.size());
+
+            std::vector<uint8_t> m1_c(m1_size_max), m2_c(m2_size_max), m3_c(m3_size_max);
+
+            size_t m1_csize = ZSTD_compress(m1_c.data(), m1_size_max, m1.data(), m1.size(), 3);
+            size_t m2_csize = ZSTD_compress(m2_c.data(), m2_size_max, m2.data(), m2.size(), 3);
+            size_t m3_csize = ZSTD_compress(m3_c.data(), m3_size_max, m3.data(), m3.size(), 3);
+
+            size_t minimum = std::min({m1_csize, m2_csize, m3_csize});
+            if (minimum == m1_csize) {
+                m1_c.resize(m1_csize);
+                rec.off = (1ULL << 62) | running_offset;
+                running_offset += m1_csize;
+
+                std::fwrite(m1_c.data(), 1, m1_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            } else if (minimum == m2_csize) {
+                m2_c.resize(m2_csize);
+                rec.off = (2ULL << 62) | running_offset;
+                running_offset += m2_csize;
+
+                std::fwrite(m2_c.data(), 1, m2_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            } else {
+                m3_c.resize(m3_csize);
+                rec.off = (3ULL << 62) | running_offset;
+                running_offset += m3_csize;
+
+                std::fwrite(m3_c.data(), 1, m3_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            }
+        }
+    } else {
+        std::uint64_t num_iterations = (end_rec_offset - start_rec_offset) >> 12;
+        std::fseek(unused_rec_db, start_rec_offset, SEEK_SET);
+        for (std::uint64_t i = 0; i < num_iterations; i ++) {
+            PageIdxRec rec;
+            std::fread(&rec, sizeof(rec), 1, unused_rec_db);
+            std::fseek(unused_tier_db, file_offset + rec.off, SEEK_SET);
+
+            std::uint8_t buf[4096];
+            std::fread(buf, 1, 4096, unused_tier_db);
+
+            // Try all compression schemes
+            std::vector<std::uint8_t> m1 = serialize_key_map(buf);
+            std::array<std::uint8_t, 4096> m2 = impute_invalid_values(buf);
+            std::vector<std::uint8_t> m3 = serialize_nodes(merge_page_bytes(buf)); 
+
+            size_t m1_size_max = ZSTD_compressBound(m1.size()), m2_size_max = ZSTD_compressBound(m2.size()), m3_size_max = ZSTD_compressBound(m3.size());
+            std::vector<uint8_t> m1_c(m1_size_max), m2_c(m2_size_max), m3_c(m3_size_max);
+            
+            // Compression level 3, can be tuned
+            size_t m1_csize = ZSTD_compress(m1_c.data(), m1_size_max, m1.data(), m1.size(), 3);
+            size_t m2_csize = ZSTD_compress(m2_c.data(), m2_size_max, m2.data(), m2.size(), 3);
+            size_t m3_csize = ZSTD_compress(m3_c.data(), m3_size_max, m3.data(), m3.size(), 3);
+
+            size_t minimum = std::min({m1_csize, m2_csize, m3_csize});
+            if (minimum == m1_csize) {
+                m1_c.resize(m1_csize);
+                rec.off = (1 << 62) | running_offset;
+                running_offset += m1_csize;
+                
+                std::fwrite(m1_c.data(), 1, m1_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            } else if (minimum == m2_csize) {
+                m2_c.resize(m2_csize);
+                rec.off = (2 << 62) | running_offset;
+                running_offset += m2_csize;
+                
+                std::fwrite(m2_c.data(), 1, m2_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            } else {
+                m3_c.resize(m3_csize);
+                rec.off = (3 << 62) | running_offset;
+                running_offset += m3_csize;
+                
+                std::fwrite(m3_c.data(), 1, m3_c.size(), new_tier_db);
+                std::fwrite(&rec, sizeof(rec), 1, new_rec_db);
+            }
+        }
+    }
+
+    std::fflush(new_tier_db); std::fflush(new_rec_db);
+    std::fclose(unused_tier_db); std::fclose(unused_rec_db);
+    std::fclose(new_tier_db); std::fclose(new_rec_db);
 }
 
 } // namespace pageops

@@ -487,6 +487,14 @@ int main(int argc, char** argv) {
     std::vector<std::vector<uint64_t>> rec_offsets(game::MAX_TIER + 1, std::vector<uint64_t>(W, 0));
     std::vector<uint64_t> data_flat((game::MAX_TIER + 1) * W, 0);
     std::vector<uint64_t> rec_flat((game::MAX_TIER + 1) * W, 0);
+
+    // Utility function for getting correct offsets
+    auto get_next_offset = [&](std::vector<std::uint64_t> vec, std::uint64_t curr) -> std::uint64_t {
+        std::vector<std::uint64_t> sorted = vec;
+        std::sort(sorted.begin(), sorted.end());
+        for (std::uint64_t off : sorted) {if (off > curr) return off;}
+        return 0;
+    };
     
     // Safe file creation 
     int mode = MPI_MODE_WRONLY | MPI_MODE_CREATE;
@@ -523,11 +531,19 @@ int main(int argc, char** argv) {
             std::memcpy(rec_offsets[i].data(), &rec_flat[i*W], W * sizeof(uint64_t));
         }
         MPI_Barrier(MPI_COMM_WORLD);
-        int mode = (R == 0) ? (MPI_MODE_WRONLY | MPI_MODE_CREATE) : MPI_MODE_WRONLY;
-
+        // Compression 
+        if (global_tier <= game::MAX_TIER - 2) {
+            int compressable_tier = global_tier + 2;
+            std::uint64_t curr_off = rec_offsets[compressable_tier][R];
+            std::uint64_t next_off = get_next_offset(rec_offsets[compressable_tier], curr_off);
+            pageops::compress_all_pages(compressable_tier, R, data_offsets[compressable_tier][R], curr_off, next_off);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
         tier_db  = pageops::init_db_write_only("data", "dat", global_tier, MPI_COMM_WORLD, mode);
         tier_rec = pageops::init_db_write_only("data", "idx", global_tier, MPI_COMM_WORLD, mode);
     } while (true);
+
+    // Todo: final part pull through;
 
     std::printf("Rank %d: Finished solving stage\n", R);
 
@@ -555,5 +571,7 @@ int main(int argc, char** argv) {
 // mpic++ -std=c++20 -O3 -march=native -DNDEBUG -Wall -Wextra \
 //     -I/opt/homebrew/opt/libomp/include \
 //     -L/opt/homebrew/opt/libomp/lib -lomp \
+//     -I/opt/homebrew/include \
+//     -L/opt/homebrew/lib -lzstd \
 //     -o othello6 main.cpp
 // mpirun -np 8 ./othello6
